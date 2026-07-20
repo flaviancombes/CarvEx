@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>CarvEx — Rapport forensic</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <a class="brand" href="#" aria-label="CarvEx, accueil du rapport">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span><strong>CarvEx</strong><small>Forensic file analysis</small></span>
+      </a>
+      <div class="case-context">
+        <span class="eyebrow">Rapport d'analyse</span>
+        <span id="caseSummary">Initialisation…</span>
+      </div>
+      <label class="search-field" for="search">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input id="search" type="search" autocomplete="off" placeholder="Rechercher un fichier, hash, type…">
+        <kbd>Esc</kbd>
+      </label>
+    </header>
+
+    <main class="dashboard">
+      <section class="metrics" aria-label="Synthèse de l'analyse">
+        <article class="metric-card"><span class="metric-icon files" aria-hidden="true">▤</span><div><span class="metric-label">Fichiers récupérés</span><strong id="totalFiles">0</strong></div></article>
+        <article class="metric-card"><span class="metric-icon size" aria-hidden="true">◒</span><div><span class="metric-label">Volume analysé</span><strong id="totalSize">0 o</strong></div></article>
+        <article class="metric-card"><span class="metric-icon duplicate" aria-hidden="true">⧉</span><div><span class="metric-label">Groupes de doublons</span><strong id="duplicates">0</strong></div></article>
+        <article class="metric-card"><span class="metric-icon category" aria-hidden="true">◇</span><div><span class="metric-label">Catégories</span><strong id="categoryCount">0</strong></div></article>
+      </section>
+
+      <section class="workspace" aria-label="Explorateur de fichiers">
+        <section class="results-panel" aria-labelledby="resultsTitle">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Éléments récupérés</span>
+              <h1 id="resultsTitle">Explorateur de fichiers</h1>
+            </div>
+            <span class="result-count" id="resultCount" aria-live="polite">0 fichier</span>
+          </div>
+          <div class="filter-strip" id="categoryFilters" aria-label="Filtrer par catégorie"></div>
+          <div class="file-list" role="table" aria-label="Fichiers récupérés">
+            <div class="file-list-header" role="row">
+              <span role="columnheader"><button class="sort-button" type="button" data-sort="name" aria-sort="none">Nom <b aria-hidden="true"></b></button></span>
+              <span role="columnheader"><button class="sort-button" type="button" data-sort="category" aria-sort="none">Catégorie <b aria-hidden="true"></b></button></span>
+              <span role="columnheader"><button class="sort-button" type="button" data-sort="mime" aria-sort="none">Type MIME <b aria-hidden="true"></b></button></span>
+              <span role="columnheader"><button class="sort-button" type="button" data-sort="size" aria-sort="none">Taille <b aria-hidden="true"></b></button></span>
+              <span role="columnheader"><button class="sort-button" type="button" data-sort="sha256" aria-sort="none">Empreinte SHA-256 <b aria-hidden="true"></b></button></span>
+            </div>
+            <div id="files" class="file-list-body" role="rowgroup"></div>
+          </div>
+          <div id="emptyState" class="empty-state" hidden>
+            <span aria-hidden="true">⌕</span><h2>Aucun fichier trouvé</h2><p>Modifiez votre recherche ou réinitialisez le filtre actif.</p>
+            <button id="clearFilters" type="button">Réinitialiser les filtres</button>
+          </div>
+        </section>
+
+        <aside class="details-panel" id="detailsPanel" aria-labelledby="detailsTitle">
+          <div class="details-heading"><div><span class="eyebrow">Inspection</span><h2 id="detailsTitle">Détails du fichier</h2></div><span id="detailCategoryBadge" class="category-badge" hidden></span></div>
+          <div id="detailsEmpty" class="details-empty"><span aria-hidden="true">▣</span><p>Sélectionnez un fichier pour consulter ses métadonnées.</p></div>
+          <div id="detailsContent" hidden>
+            <div class="selected-file"><span class="file-glyph" aria-hidden="true">▤</span><div><h3 id="detailName">—</h3><p id="detailMime">—</p></div></div>
+            <section class="preview-section" aria-labelledby="previewTitle">
+              <div class="preview-heading"><span class="eyebrow" id="previewTitle">Aperçu du fichier</span><a id="previewOpen" href="#" target="_blank" rel="noopener" hidden>Ouvrir</a></div>
+              <div id="filePreview" class="file-preview" aria-live="polite"></div>
+            </section>
+            <dl class="metadata-list">
+              <div><dt>Catégorie</dt><dd id="detailCategory">—</dd></div>
+              <div><dt>Taille</dt><dd id="detailSize">—</dd></div>
+              <div><dt>SHA-256</dt><dd class="copyable"><code id="detailSha256">—</code><button id="copySha256" type="button" title="Copier le SHA-256" aria-label="Copier le SHA-256">⧉</button></dd></div>
+              <div><dt>Dossier PhotoRec d'origine</dt><dd id="detailSourceDirectory">—</dd></div>
+              <div><dt>Chemin PhotoRec d'origine</dt><dd><code id="detailSourcePath">—</code></dd></div>
+              <div><dt>Emplacement exporté</dt><dd><code id="detailOutput">—</code></dd></div>
+            </dl>
+            <section class="future-section" aria-label="Extensions prévues"><span class="eyebrow">Extensions d'analyse</span><p>Cette zone est prête pour les aperçus, EXIF, timeline, VirusTotal et notes enquêteur.</p></section>
+          </div>
+        </aside>
+      </section>
+    </main>
+  </div>
+  <script>const reportData = __CARVEX_DATA__;</script>
+  <script src="app.js"></script>
+</body>
+</html>
