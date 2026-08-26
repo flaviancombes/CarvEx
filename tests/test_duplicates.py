@@ -1,45 +1,35 @@
 from pathlib import Path
 
-from core.scanner import Scanner
-from core.exporter import Exporter
-from core.duplicates import DuplicateDetector
+from core.duplicates import DuplicateCounter, DuplicateDetector
+from models.models import RecoveredFile
 
-scanner = Scanner(
-    r"C:\Users\flavi\OneDrive\Bureau\TryPHOTOREC"
-)
 
-files = scanner.scan()
+def _recovered_file(name: str, sha256: str) -> RecoveredFile:
+    return RecoveredFile(
+        path=Path(name),
+        filename=name,
+        extension=".txt",
+        mime="text/plain",
+        size=1,
+        sha256=sha256,
+    )
 
-exporter = Exporter(
-    Path("output")
-)
 
-detector = DuplicateDetector()
+def test_duplicate_detector_groups_only_identical_hashes() -> None:
+    detector = DuplicateDetector()
+    detector.add(_recovered_file("one.txt", "same"))
+    detector.add(_recovered_file("two.txt", "same"))
+    detector.add(_recovered_file("three.txt", "other"))
 
-for file in files:
+    assert [file.filename for file in detector.duplicates()["same"]] == ["one.txt", "two.txt"]
+    assert detector.unique()["other"].filename == "three.txt"
 
-    exporter.export(file)
 
-    detector.add(file)
+def test_duplicate_counter_keeps_only_hash_counts_during_streaming_import() -> None:
+    counter = DuplicateCounter()
+    counter.add("same")
+    counter.add("same")
+    counter.add("same")
+    counter.add("other")
 
-duplicates = detector.duplicates()
-
-print()
-
-print("=" * 60)
-print("DOUBLONS")
-print("=" * 60)
-
-for sha256, group in duplicates.items():
-
-    print()
-
-    print(sha256)
-
-    for f in group:
-
-        print("   ", f.filename)
-
-print()
-
-print("Nombre de groupes :", len(duplicates))
+    assert counter.group_count == 1

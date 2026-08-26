@@ -1,0 +1,148 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carvex"
+version = "1.0.0"
+description = "Application PySide6 de post-traitement des résultats PhotoRec pour l'investigation DFIR"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "CarvEx contributors" }]
+keywords = ["dfir", "forensics", "photorec", "pyside6", "investigation"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Information Technology",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "filetype==1.2.0",
+    "tqdm==4.69.0",
+    "Pillow==12.3.0",
+    "pypdf>=5,<7",
+    "mutagen>=1.47,<2",
+    "pandas==3.0.3",
+    "rich==14.0.0",
+    "jinja2==3.1.6",
+    "PySide6>=6.6,<7",
+]
+
+[project.scripts]
+carvex = "main:main"
+
+[project.urls]
+Documentation = "https://github.com/carvex/carvex#readme"
+Issues = "https://github.com/carvex/carvex/issues"
+
+[tool.setuptools]
+py-modules = ["carvex", "config", "main"]
+
+[tool.setuptools.packages.find]
+include = [
+    "analysis*",
+    "bookmarks*",
+    "core*",
+    "investigation*",
+    "metadata*",
+    "models*",
+    "project*",
+    "report*",
+    "reports*",
+    "selection*",
+    "timeline*",
+    "ui*",
+    "utils*",
+]
+
+[tool.setuptools.package-data]
+reports = ["*.html", "*.css", "*.js"]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10,<26",
+    "mypy>=1.13,<2",
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<7",
+    "pytest-qt>=4.5,<5",
+    "ruff>=0.8,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Les packages CarvEx sont placés à la racine du dépôt. Cette entrée reste
+# nécessaire si pytest est lancé avec le mode importlib ou depuis un outil IDE.
+pythonpath = ["."]
+addopts = "-ra --strict-markers --import-mode=prepend"
+qt_api = "pyside6"
+
+[tool.coverage.run]
+branch = true
+source = [
+    "analysis",
+    "bookmarks",
+    "core",
+    "investigation",
+    "metadata",
+    "models",
+    "project",
+    "report",
+    "selection",
+    "timeline",
+    "ui",
+    "utils",
+]
+omit = [
+    "tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 75
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+extend-exclude = '(^|/)(build|dist|\.venv)/'
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+follow_imports = "skip"
+ignore_missing_imports = true
+warn_unused_ignores = true
+explicit_package_bases = true
+files = [
+    "core/file_identity.py",
+    "core/report_loader.py",
+    "project/locking.py",
+    "project/models.py",
+]
+exclude = [
+    "build/",
+    "dist/",
+    ".venv/",
+    "output/",
+    "report.html/",
+]

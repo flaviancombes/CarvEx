@@ -3,8 +3,8 @@ CarvEx
 Exporter
 """
 
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 from core.classifier import Classifier
 from core.hashing import Hasher
@@ -19,19 +19,13 @@ class Exporter:
     def export(self, recovered_file):
 
         category, subtype = Classifier.destination(
-            recovered_file.mime
+            recovered_file.mime,
+            recovered_file.extension,
         )
 
-        destination = (
-            self.output /
-            category /
-            subtype
-        )
+        destination = self.output / category / subtype
 
-        destination.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+        destination.mkdir(parents=True, exist_ok=True)
 
         filename = recovered_file.filename
 
@@ -41,19 +35,13 @@ class Exporter:
 
         while target.exists():
 
-            target = destination / (
-                f"{target.stem}_{counter}"
-                f"{target.suffix}"
-            )
+            target = destination / (f"{target.stem}_{counter}" f"{target.suffix}")
 
             counter += 1
 
-        shutil.copy2(
-            recovered_file.path,
-            target
-        )
+        shutil.copy2(recovered_file.path, target)
         recovered_file.sha256 = Hasher.sha256(target)
-        
+
         recovered_file.output_path = target
 
         recovered_file.category = category

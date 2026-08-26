@@ -5,24 +5,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from core.report_loader import ReportLoadError, ReportLoader
+from core.report_loader import ReportLoader, ReportLoadError
+from project.storage import JsonProjectStorage
 from ui.main_window import MainWindow
 from ui.theme import apply_theme
+from utils.performance import measure
 
 
 def _report_directory_from_arguments() -> Path | None:
     """Retourne le dossier de destination fourni à ``main.py``."""
     return Path(sys.argv[1]) if len(sys.argv) > 1 else None
-
-
-def _choose_report_directory() -> Path | None:
-    directory = QFileDialog.getExistingDirectory(
-        None,
-        "Sélectionner le dossier de destination CarvEx",
-    )
-    return Path(directory) if directory else None
 
 
 def main() -> int:
@@ -33,13 +27,19 @@ def main() -> int:
     apply_theme(app)
 
     window = MainWindow()
-    destination = _report_directory_from_arguments() or _choose_report_directory()
+    destination = _report_directory_from_arguments()
 
     if destination:
-        try:
-            window.load_report(ReportLoader.load(destination))
-        except ReportLoadError as error:
-            QMessageBox.warning(window, "Rapport CarvEx introuvable", str(error))
+        if JsonProjectStorage.exists(destination):
+            window._open_recent_project(str(destination))
+        else:
+            try:
+                with measure("report.open", destination=destination):
+                    report = ReportLoader.load(destination)
+                with measure("ui.report_bind", files=len(report.files)):
+                    window.load_report(report)
+            except ReportLoadError as error:
+                QMessageBox.warning(window, "Rapport CarvEx introuvable", str(error))
 
     window.show()
     return app.exec()

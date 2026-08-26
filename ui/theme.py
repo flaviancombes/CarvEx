@@ -57,6 +57,8 @@ QTextEdit {{ background: {Colors.PANEL_SECONDARY}; border: 1px solid #38383C; bo
 #previewPanel {{ background: {Colors.PANEL_SECONDARY}; border: 1px solid {Colors.BORDER}; border-radius: 6px; }}
 #previewPanel QLabel {{ color: {Colors.TEXT_SECONDARY}; }}
 #detailsTitle {{ color: {Colors.TEXT}; font-size: 12pt; font-weight: 600; }}
+#artifactBadge {{ background: #163B52; border: 1px solid #39617D; border-radius: 9px; color: {Colors.TEXT}; font-weight: 600; padding: 3px 8px; }}
+#artifactBadge[severity="warning"] {{ background: #4A3520; border-color: #9D6C2B; }}
 QStatusBar {{ background: {Colors.PANEL}; color: {Colors.TEXT_SECONDARY}; border-top: 1px solid {Colors.BORDER}; }}
 QStatusBar::item {{ border: 0; }}
 QSplitter::handle {{ background: {Colors.BACKGROUND}; width: 5px; }}

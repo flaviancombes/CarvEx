@@ -3,8 +3,8 @@ CarvEx
 SHA256 Hashing
 """
 
-from pathlib import Path
 import hashlib
+from pathlib import Path
 
 BUFFER_SIZE = 1024 * 1024  # 1 Mo
 

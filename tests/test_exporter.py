@@ -1,20 +1,20 @@
-from pathlib import Path
-
-from core.scanner import Scanner
 from core.exporter import Exporter
+from models.models import RecoveredFile
 
-scanner = Scanner(
-    r"C:\Users\flavi\OneDrive\Bureau\TryPHOTOREC"
-)
 
-files = scanner.scan()
+def test_exporter_copies_file_and_records_hash(tmp_path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("CarvEx", encoding="utf-8")
+    recovered = RecoveredFile(
+        path=source,
+        filename=source.name,
+        extension=".txt",
+        mime="text/plain",
+        size=source.stat().st_size,
+    )
 
-exporter = Exporter(
-    Path("output")
-)
+    target = Exporter(tmp_path / "output").export(recovered)
 
-for file in files:
-
-    exporter.export(file)
-
-print(f"{len(files)} fichiers exportés.")
+    assert target.read_text(encoding="utf-8") == "CarvEx"
+    assert recovered.output_path == target
+    assert recovered.sha256

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from math import ceil
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QFrame, QTextEdit
 
 from ui.theme import Metrics
@@ -19,8 +19,7 @@ class SelectableTextField(QTextEdit):
         self.setUndoRedoEnabled(False)
         self.setAcceptRichText(False)
         self.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)

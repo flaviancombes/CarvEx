@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const data = reportData;
+  let data = { total_files: 0, total_size: 0, duplicates: 0, categories: {}, files: [] };
   const state = { query: "", category: "", selectedIndex: null, sort: { key: "", direction: "ascending" } };
   const elements = {
     search: document.querySelector("#search"), files: document.querySelector("#files"), filters: document.querySelector("#categoryFilters"),
@@ -120,7 +120,20 @@
       elements.clear.addEventListener("click", () => { state.query = ""; state.category = ""; elements.search.value = ""; Dashboard.renderFilters(); FileList.render(); elements.search.focus(); });
       document.querySelector("#copySha256").addEventListener("click", async () => { const value = document.querySelector("#detailSha256").textContent; if (!value || value === "Non disponible") return; try { await navigator.clipboard.writeText(value); const button = document.querySelector("#copySha256"); button.textContent = "✓"; setTimeout(() => { button.textContent = "⧉"; }, 1200); } catch (_) { /* Clipboard access may be unavailable for file:// reports. */ } });
     },
-    init() { Dashboard.render(); Dashboard.renderFilters(); Sort.renderHeaders(); FileList.render(); DetailsPanel.clear(); this.bind(); }
+    async init() {
+      try {
+        const response = await fetch(document.body.dataset.reportSource, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (!payload || !Array.isArray(payload.files)) throw new Error("Format de données invalide");
+        data = payload;
+        Dashboard.render(); Dashboard.renderFilters(); Sort.renderHeaders(); FileList.render(); DetailsPanel.clear(); this.bind();
+      } catch (_) {
+        elements.empty.hidden = false;
+        elements.empty.querySelector("h2").textContent = "Données du rapport indisponibles";
+        elements.empty.querySelector("p").textContent = "Ouvrez ce rapport depuis CarvEx ou un serveur HTTP local autorisant report-data.json.";
+      }
+    }
   };
   UI.init();
 })();

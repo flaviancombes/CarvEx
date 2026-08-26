@@ -12,8 +12,4 @@ THREADS = 8
 
 BUFFER_SIZE = 1024 * 1024
 
-IGNORED_FILES = {
-    "Thumbs.db",
-    "desktop.ini",
-    ".DS_Store"
-}
+IGNORED_FILES = {"Thumbs.db", "desktop.ini", ".DS_Store"}

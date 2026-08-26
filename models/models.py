@@ -59,8 +59,4 @@ class RecoveredFile:
 
     def __str__(self):
 
-        return (
-            f"{self.filename} | "
-            f"{self.mime} | "
-            f"{self.size_mb} MB"
-        )
+        return f"{self.filename} | " f"{self.mime} | " f"{self.size_mb} MB"

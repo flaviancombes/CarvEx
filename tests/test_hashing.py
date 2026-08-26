@@ -1,26 +1,8 @@
-from pathlib import Path
+from core.hashing import Hasher
 
-from core.scanner import Scanner
-from core.exporter import Exporter
 
-scanner = Scanner(
-    r"C:\Users\flavi\OneDrive\Bureau\TryPHOTOREC"
-)
+def test_sha256_is_deterministic_for_a_local_fixture(tmp_path) -> None:
+    source = tmp_path / "evidence.bin"
+    source.write_bytes(b"CarvEx")
 
-files = scanner.scan()
-
-exporter = Exporter(
-    Path("output")
-)
-
-for file in files:
-
-    exporter.export(file)
-
-print()
-
-for file in files[:10]:
-
-    print(file.filename)
-    print(file.sha256)
-    print()
+    assert Hasher.sha256(source) == "6a8674efee7638a4766a32995d485bb5b540735d167cbdca026d003c9790049d"
