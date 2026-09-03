@@ -25,7 +25,8 @@ from project.storage import JsonProjectStorage
 from ui.photo_rec_import_worker import PhotoRecImportWorker
 from ui.project_dialogs import NewProjectDialog
 from ui.ui_responsiveness_instrumentation import mark_pipeline_finished, start_ui_responsiveness_probe
-from utils.performance import finish_pipeline_profile, pipeline_stage, start_pipeline_profile
+from utils import performance
+from utils.performance import finish_pipeline_profile, measure, operation, pipeline_stage, start_pipeline_profile
 
 
 class ProjectWorkflowController(QObject):
@@ -150,7 +151,7 @@ class ProjectWorkflowController(QObject):
             self._show_status("Rapport source non chargé : chaîne de conservation à confirmer.")
             return
         try:
-            with pipeline_stage("ProjectWorkflowController.load_report"):
+            with operation("ProjectWorkflow", "load_report"), pipeline_stage("ProjectWorkflowController.load_report"):
                 self._load_report(report, update_metadata)
         except LegacyFileIdentityError as error:
             if progress is not None:
@@ -236,9 +237,10 @@ class ProjectWorkflowController(QObject):
     def save_project(self) -> None:
         if self._project_manager.active_project is None:
             return
-        self._capture_workspace()
-        self._project_manager.save_project()
-        self._refresh_ui()
+        with operation("ProjectWorkflow", "save_project"):
+            self._capture_workspace()
+            self._project_manager.save_project()
+            self._refresh_ui()
 
     def save_project_as(self) -> None:
         if self._project_manager.active_project is None:
@@ -260,9 +262,24 @@ class ProjectWorkflowController(QObject):
             self._clear_project_ui()
 
     def prepare_project_change(self) -> bool:
-        if self._project_manager.active_project is None:
+        with measure("shutdown.total"), operation("Shutdown", "total"):
+            return self._prepare_project_change()
+
+    def _prepare_project_change(self) -> bool:
+        project = self._project_manager.active_project
+        if project is None:
+            if performance.ENABLED:
+                performance.LOGGER.info("[Shutdown] close requested active_project=false")
             return True
-        self._capture_workspace()
+        if performance.ENABLED:
+            performance.LOGGER.info(
+                "[Shutdown] close requested active_project=true dirty=%s",
+                self._project_manager.is_dirty,
+            )
+        with measure("shutdown.capture_workspace"), operation("Shutdown", "capture_workspace"):
+            self._capture_workspace()
+        if performance.ENABLED:
+            self._project_manager.log_dirty_state("after_capture_workspace")
         if self._project_manager.is_dirty:
             answer = QMessageBox.question(
                 self._parent,
@@ -276,12 +293,21 @@ class ProjectWorkflowController(QObject):
             if answer == QMessageBox.StandardButton.Cancel:
                 return False
             if answer == QMessageBox.StandardButton.Save:
-                self.save_project()
-                self._project_manager.close_project(save=True)
+                # ``close_project(save=True)`` prépare et persiste déjà toutes
+                # les données. Appeler ``save_project`` juste avant sérialisait
+                # le projet complet une deuxième fois sans rendre les données
+                # plus sûres.
+                with (
+                    measure("shutdown.project_close_after_save_choice"),
+                    operation("Shutdown", "project_close_after_save_choice"),
+                ):
+                    self._project_manager.close_project(save=True)
             else:
-                self._project_manager.close_project(save=False)
+                with measure("shutdown.project_close_discard"), operation("Shutdown", "project_close_discard"):
+                    self._project_manager.close_project(save=False)
         else:
-            self._project_manager.close_project(save=True)
+            with measure("shutdown.project_close_clean"), operation("Shutdown", "project_close_clean"):
+                self._project_manager.close_project(save=True)
         return True
 
     def load_saved_report_source(self, project) -> None:

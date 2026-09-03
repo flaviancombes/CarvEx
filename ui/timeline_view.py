@@ -31,14 +31,18 @@ from timeline.manager import TimelineManager
 from timeline.model import TimelineFilterProxyModel, TimelineTableModel
 from timeline.repository import TimelineBuildSession
 from timeline.service import TimelineService
+from ui.background_activity import BackgroundTaskRegistry
 from ui.bookmark_delegate import BookmarkStarDelegate
 from ui.investigation_context_menu import append_investigation_actions
+from utils import performance
 
 
 class _TimelineBuildWorker(QObject):
     """Execute a Timeline build session outside the Qt GUI thread."""
 
     batch_ready = Signal(int, object)
+    progress = Signal(int, int)
+    finalizing = Signal(int)
     completed = Signal(int)
     failed = Signal(int, str)
     finished = Signal()
@@ -63,6 +67,7 @@ class _TimelineBuildWorker(QObject):
     def run(self) -> None:
         try:
             groups: dict[str, list[TimelineEvent]] = {}
+            last_progress = -1
             while True:
                 events, complete = self._session.next_batch(self._batch_size)
                 if events:
@@ -70,8 +75,12 @@ class _TimelineBuildWorker(QObject):
                         record = event.file_record or {}
                         key = str(record.get("file_id") or event.event_id)
                         groups.setdefault(key, []).append(event)
+                if self._session.processed_records != last_progress:
+                    last_progress = self._session.processed_records
+                    self.progress.emit(self._generation, last_progress)
                 if complete:
                     break
+            self.finalizing.emit(self._generation)
             self._emit_chronological_batches(groups)
             self.completed.emit(self._generation)
         except Exception as error:
@@ -111,6 +120,7 @@ class TimelineView(QWidget):
         parent=None,
         entity_resolver: CanonicalEntityResolver | None = None,
         file_selection: FileSelectionModel | None = None,
+        background_tasks: BackgroundTaskRegistry | None = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
@@ -130,6 +140,7 @@ class TimelineView(QWidget):
         self._pending_sort_state: tuple[int, Qt.SortOrder] | None = None
         self._investigation_presence_lookup: Callable[[object], bool] | None = None
         self._entity_resolver = entity_resolver or CanonicalEntityResolver()
+        self._background_tasks = background_tasks
         self.file_selection = file_selection or FileSelectionModel(self)
         self._model = TimelineTableModel(
             bookmark_service=bookmark_service,
@@ -248,42 +259,61 @@ class TimelineView(QWidget):
     def load_events(self) -> None:
         if self._loaded:
             return
-        self._loaded = True
-        self._stop_build()
-        self._build_generation += 1
-        generation = self._build_generation
-        self._build_session = self._service.start_build(retain_events=False)
-        self._model.set_events([])
-        self._proxy.sort(-1)
-        self._proxy.setDynamicSortFilter(False)
-        self._proxy.set_building(True)
-        self._proxy.setSourceModel(None)
-        self.table.setUpdatesEnabled(False)
-        self._pending_projection_batches.clear()
-        self._projection_scheduled = False
-        self._worker_completed = False
-        self._bulk_projection_active = True
-        self._projection_proxy_attached = False
-        self._event_types = {}
-        thread = QThread(self)
-        worker = _TimelineBuildWorker(self._build_session, generation)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.batch_ready.connect(self._append_batch, Qt.ConnectionType.QueuedConnection)
-        worker.completed.connect(self._finish_build, Qt.ConnectionType.QueuedConnection)
-        worker.failed.connect(self._fail_build, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._build_thread = thread
-        self._build_worker = worker
-        thread.start()
+        with performance.operation("TimelineView", "start_build"):
+            self._loaded = True
+            self._stop_build()
+            self._build_generation += 1
+            generation = self._build_generation
+            self._build_session = self._service.start_build(retain_events=False)
+            if self._background_tasks is not None:
+                self._background_tasks.start_task(
+                    "timeline",
+                    "Construction de la Timeline",
+                    total=self._service.record_count,
+                )
+            self._model.set_events([])
+            self._proxy.sort(-1)
+            self._proxy.setDynamicSortFilter(False)
+            self._proxy.set_building(True)
+            self._proxy.setSourceModel(None)
+            self.table.setUpdatesEnabled(False)
+            self._pending_projection_batches.clear()
+            self._projection_scheduled = False
+            self._worker_completed = False
+            self._bulk_projection_active = True
+            self._projection_proxy_attached = False
+            self._event_types = {}
+            thread = QThread(self)
+            worker = _TimelineBuildWorker(self._build_session, generation)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.batch_ready.connect(self._append_batch, Qt.ConnectionType.QueuedConnection)
+            worker.progress.connect(self._update_build_progress, Qt.ConnectionType.QueuedConnection)
+            worker.finalizing.connect(self._begin_finalization, Qt.ConnectionType.QueuedConnection)
+            worker.completed.connect(self._finish_build, Qt.ConnectionType.QueuedConnection)
+            worker.failed.connect(self._fail_build, Qt.ConnectionType.QueuedConnection)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            self._build_thread = thread
+            self._build_worker = worker
+            thread.start()
 
     @Slot(int, object)
     def _append_batch(self, generation: int, events: tuple) -> None:
         if generation != self._build_generation:
             return
         self._pending_projection_batches.append(events)
+
+    @Slot(int, int)
+    def _update_build_progress(self, generation: int, current: int) -> None:
+        if generation == self._build_generation and self._background_tasks is not None:
+            self._background_tasks.update_task("timeline", current=current)
+
+    @Slot(int)
+    def _begin_finalization(self, generation: int) -> None:
+        if generation == self._build_generation and self._background_tasks is not None:
+            self._background_tasks.set_phase("timeline", "Finalisation de la Timeline…")
 
     @Slot(int)
     def _finish_build(self, generation: int) -> None:
@@ -303,10 +333,11 @@ class TimelineView(QWidget):
         self._projection_scheduled = False
         if self._pending_projection_batches:
             events = self._pending_projection_batches.popleft()
-            self._model.append_events(events)
-            for event in events:
-                self._event_types.setdefault(event.event_type.identifier, event.event_type)
-            self._attach_projection_proxy()
+            with performance.operation("TimelineView", "project_checkpoint"):
+                self._model.append_events(events)
+                for event in events:
+                    self._event_types.setdefault(event.event_type.identifier, event.event_type)
+                self._attach_projection_proxy()
             self._schedule_projection()
             return
         if self._worker_completed:
@@ -337,6 +368,8 @@ class TimelineView(QWidget):
             self._pending_sort_state = None
         else:
             self._set_initial_sort_indicator()
+        if self._background_tasks is not None:
+            self._background_tasks.finish_task("timeline")
 
     def _attach_projection_proxy(self) -> None:
         if self._projection_proxy_attached:
@@ -361,6 +394,8 @@ class TimelineView(QWidget):
             self._bulk_projection_active = False
         self._proxy.setDynamicSortFilter(True)
         self._proxy.set_building(False)
+        if self._background_tasks is not None:
+            self._background_tasks.finish_task("timeline", cancelled=True)
 
     def _stop_build(self) -> None:
         if self._build_worker is not None:
@@ -374,6 +409,8 @@ class TimelineView(QWidget):
         self._build_worker = None
         self._build_thread = None
         self._build_session = None
+        if self._background_tasks is not None:
+            self._background_tasks.finish_task("timeline", cancelled=True)
 
     def reset_events(self) -> None:
         self._loaded = False

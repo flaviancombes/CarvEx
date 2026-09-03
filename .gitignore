@@ -28,6 +28,7 @@ Thumbs.db
 
 # Local CarvEx execution data and projects
 logs/
+carvex_perf.log
 output/
 *.carvex/
 .carvex.lock/

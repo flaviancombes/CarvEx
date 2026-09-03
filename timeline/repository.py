@@ -26,6 +26,11 @@ class TimelineRepository:
         self._events = None
         self._engine.clear_cache()
 
+    @property
+    def record_count(self) -> int:
+        """Nombre de preuves source, disponible sans matérialiser d'événement."""
+        return len(self._records)
+
     def all_events(self) -> tuple[TimelineEvent, ...]:
         """Materialize the legacy global index only for consumers explicitly requesting it."""
         if self._events is None:
@@ -59,6 +64,7 @@ class TimelineBuildSession:
     ready_events: tuple[TimelineEvent, ...] = ()
     _events: list[TimelineEvent] | None = field(default=None, init=False)
     _cancelled: Event = field(default_factory=Event, init=False)
+    processed_records: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.retain_events:
@@ -88,6 +94,7 @@ class TimelineBuildSession:
                         self.complete = True
                         break
                     record = next(self.records)
+                    self.processed_records += 1
                     new_events = self.repository._engine.events_for(record)
                     if self._events is not None:
                         self._events.extend(new_events)

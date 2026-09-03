@@ -154,6 +154,78 @@ class UiResponsivenessProbe(QObject):
 _active_probe: UiResponsivenessProbe | None = None
 
 
+class UiEventLoopMonitor(QObject):
+    """Détecte les tours de boucle Qt retardés et les relie aux opérations récentes."""
+
+    def __init__(self, parent: QWidget, interval_ms: int = 100, threshold_ms: int = 150) -> None:
+        super().__init__(parent)
+        self._application = QApplication.instance()
+        self._interval_ms = interval_ms
+        self._threshold_ms = threshold_ms
+        self._last_tick = perf_counter()
+        self._last_event = "unknown"
+        self._closed = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._on_tick)
+        if self._application is not None:
+            self._application.installEventFilter(self)
+        self._timer.start()
+
+    def eventFilter(self, _watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if not self._closed:
+            self._last_event = event.type().name
+        return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._timer.stop()
+        if self._application is not None:
+            self._application.removeEventFilter(self)
+
+    def _on_tick(self) -> None:
+        now = perf_counter()
+        elapsed_ms = (now - self._last_tick) * 1000
+        self._last_tick = now
+        if elapsed_ms <= self._interval_ms + self._threshold_ms:
+            return
+        recent = performance.recent_operations()
+        context = (
+            "; ".join(
+                f"{entry.component}.{entry.operation}={entry.duration_ms:.1f}ms/{entry.thread_name}"
+                for entry in recent[-5:]
+            )
+            or "none"
+        )
+        performance.LOGGER.warning(
+            "[UI] EVENT LOOP STARVATION duration_ms=%.2f last_event=%s recent_operations=%s",
+            elapsed_ms,
+            self._last_event,
+            context,
+        )
+
+
+_global_monitor: UiEventLoopMonitor | None = None
+
+
+def start_global_ui_event_loop_monitor(main_window: QWidget) -> None:
+    """Installe l'observateur global seulement lorsque CARVEX_PERF est actif."""
+    global _global_monitor
+    if not performance.ENABLED or _global_monitor is not None:
+        return
+    _global_monitor = UiEventLoopMonitor(main_window)
+
+
+def stop_global_ui_event_loop_monitor() -> None:
+    """Libère les hooks Qt installés pour le diagnostic global."""
+    global _global_monitor
+    if _global_monitor is not None:
+        _global_monitor.close()
+        _global_monitor = None
+
+
 def start_ui_responsiveness_probe(progress_widget: QWidget, main_window: QWidget) -> None:
     """Démarre une mesure à l'instant où le dialogue d'import atteint 100 %."""
     global _active_probe

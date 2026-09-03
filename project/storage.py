@@ -8,14 +8,17 @@ import os
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from dataclasses import is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import current_thread
 from typing import Any
 
 from project.codecs import ProjectCodecRegistry
 from project.locking import ProjectLock
-from utils.performance import pipeline_stage
+from utils.performance import ENABLED, LOGGER, log_memory_snapshot, operation, pipeline_stage
+
+_MISSING = object()
 
 
 class ProjectStorageCorruptionError(ValueError):
@@ -51,6 +54,15 @@ class ProjectStorageAdapter(ABC):
     @abstractmethod
     def is_dirty(self) -> bool: ...
 
+    def dirty_details(self) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        """Expose un diagnostic borné des modifications en attente.
+
+        Les adaptateurs peuvent ne connaître que leur indicateur global. Le
+        backend JSON complète ce contrat avec les namespaces et opérations
+        responsables, uniquement à des fins de diagnostic.
+        """
+        return self.is_dirty, (), ()
+
     @abstractmethod
     def flush(self) -> None: ...
 
@@ -64,6 +76,7 @@ class InMemoryProjectStorage(ProjectStorageAdapter):
     def __init__(self) -> None:
         self._namespaces: dict[str, dict[str, Any]] = {}
         self._dirty = False
+        self._dirty_namespaces: set[str] = set()
 
     def configure_codecs(self, registry: ProjectCodecRegistry) -> None:
         # Les objets ne sont jamais transformés dans le backend mémoire.
@@ -73,12 +86,20 @@ class InMemoryProjectStorage(ProjectStorageAdapter):
         return self._namespaces.get(namespace, {}).get(key, default)
 
     def write(self, namespace: str, key: str, value: Any) -> None:
-        self._namespaces.setdefault(namespace, {})[key] = value
+        values = self._namespaces.setdefault(namespace, {})
+        if not self._dirty and values.get(key, _MISSING) == value:
+            return
+        values[key] = value
         self._dirty = True
+        self._dirty_namespaces.add(namespace)
 
     def delete(self, namespace: str, key: str) -> None:
-        self._namespaces.get(namespace, {}).pop(key, None)
+        values = self._namespaces.get(namespace, {})
+        if key not in values:
+            return
+        values.pop(key)
         self._dirty = True
+        self._dirty_namespaces.add(namespace)
 
     def keys(self, namespace: str) -> Iterable[str]:
         return tuple(self._namespaces.get(namespace, {}))
@@ -89,6 +110,10 @@ class InMemoryProjectStorage(ProjectStorageAdapter):
 
     def flush(self) -> None:
         self._dirty = False
+        self._dirty_namespaces.clear()
+
+    def dirty_details(self) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        return self._dirty, tuple(sorted(self._dirty_namespaces)), ()
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         return {namespace: dict(values) for namespace, values in self._namespaces.items()}
@@ -129,6 +154,8 @@ class JsonProjectStorage(ProjectStorageAdapter):
             else:
                 self._entry_needs_write = True
         self._dirty = False
+        self._dirty_namespaces: set[str] = set()
+        self._dirty_operations: dict[str, str] = {}
         self._namespaces: dict[str, dict[str, Any]] | None = {} if create else None
         self._codecs: ProjectCodecRegistry | None = None
 
@@ -150,12 +177,31 @@ class JsonProjectStorage(ProjectStorageAdapter):
         return self._ensure_decoded().get(namespace, {}).get(key, default)
 
     def write(self, namespace: str, key: str, value: Any) -> None:
-        self._ensure_decoded().setdefault(namespace, {})[key] = value
-        self._dirty = True
+        values = self._ensure_decoded().setdefault(namespace, {})
+        # Une comparaison structurelle n'est nécessaire que lorsqu'elle peut
+        # éviter une sérialisation complète. Une fois dirty, le flush est déjà
+        # requis : ne comparons pas un index potentiellement massif une seconde
+        # fois pour une écriture qui sera persistée de toute façon.
+        current = values.get(key, _MISSING)
+        if not self._dirty and current == value:
+            return
+        if ENABLED and not self._dirty and namespace == "workspaces":
+            changes = _bounded_structural_diff(current, value)
+            LOGGER.info(
+                "[Storage] clean write differs namespace=%s key=%s changed_paths=%s",
+                namespace,
+                key,
+                changes,
+            )
+        values[key] = value
+        self._mark_dirty(namespace, f"write:{key}")
 
     def delete(self, namespace: str, key: str) -> None:
-        self._ensure_decoded().get(namespace, {}).pop(key, None)
-        self._dirty = True
+        values = self._ensure_decoded().get(namespace, {})
+        if key not in values:
+            return
+        values.pop(key)
+        self._mark_dirty(namespace, f"delete:{key}")
 
     def keys(self, namespace: str) -> Iterable[str]:
         return tuple(self._ensure_decoded().get(namespace, {}))
@@ -164,6 +210,11 @@ class JsonProjectStorage(ProjectStorageAdapter):
     def is_dirty(self) -> bool:
         return self._dirty
 
+    def dirty_details(self) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        namespaces = tuple(sorted(self._dirty_namespaces))
+        operations = tuple(f"{namespace}:{self._dirty_operations[namespace]}" for namespace in namespaces)
+        return self._dirty, namespaces, operations
+
     @property
     def recovered_from_backup(self) -> bool:
         """Whether opening restored the last known valid project document."""
@@ -171,15 +222,47 @@ class JsonProjectStorage(ProjectStorageAdapter):
 
     def flush(self) -> None:
         if not self._dirty and self._file.is_file():
+            if ENABLED:
+                LOGGER.info("[Storage] flush skipped reason=clean dirty=False dirty_namespaces=[]")
             self._ensure_entry_file()
             return
+        if ENABLED:
+            dirty, namespaces, operations = self.dirty_details()
+            LOGGER.info(
+                "[Storage] full flush reason=%s dirty=%s dirty_namespaces=%s dirty_operations=%s",
+                "dirty" if dirty else "missing_primary",
+                dirty,
+                list(namespaces),
+                list(operations),
+            )
         self.root.mkdir(parents=True, exist_ok=True)
-        with pipeline_stage("JsonProjectStorage.sérialisation"):
-            payload = json.dumps(
-                _encode(self._ensure_decoded(), self._require_codecs()), ensure_ascii=False, indent=2
-            ).encode("utf-8")
+        document = self._ensure_decoded()
+        self._validate_document(document)
+        if ENABLED:
+            namespace_entries = ",".join(f"{namespace}:{len(values)}" for namespace, values in sorted(document.items()))
+            LOGGER.info(
+                "[Sauvegarde] JsonProjectStorage.flush thread=%s namespaces=%d entries=%d entries_by_namespace=%s",
+                current_thread().name,
+                len(document),
+                sum(len(values) for values in document.values()),
+                namespace_entries,
+            )
+            log_memory_snapshot("JsonProjectStorage.before_encode")
+        with (
+            pipeline_stage("JsonProjectStorage.modèles vers primitives"),
+            operation("JsonProjectStorage", "encode_models"),
+        ):
+            encoded = _encode(document, self._require_codecs())
+        log_memory_snapshot("JsonProjectStorage.after_encode")
+        with pipeline_stage("JsonProjectStorage.encodage JSON"), operation("JsonProjectStorage", "json_dumps"):
+            payload = json.dumps(encoded, ensure_ascii=False, indent=2).encode("utf-8")
+        if ENABLED:
+            LOGGER.info("[Sauvegarde] JSON produit bytes=%d", len(payload))
+            log_memory_snapshot("JsonProjectStorage.after_json_dumps")
         with pipeline_stage("JsonProjectStorage.validation"):
-            self._validate_payload(payload)
+            # json.dumps vient de produire ``payload`` à partir du document déjà
+            # validé. Le reparser intégralement ne renforce pas sa validité.
+            self._validate_document(document)
         with pipeline_stage("JsonProjectStorage.préimage disque"):
             previous_primary = self._read_file(self._file)
             previous_checksum = self._read_file(self._checksum_file)
@@ -202,6 +285,21 @@ class JsonProjectStorage(ProjectStorageAdapter):
             self._entry_needs_write = entry_needs_write
             raise
         self._dirty = False
+        self._dirty_namespaces.clear()
+        self._dirty_operations.clear()
+        log_memory_snapshot("JsonProjectStorage.after_flush")
+
+    def _mark_dirty(self, namespace: str, operation: str) -> None:
+        was_dirty = self._dirty
+        self._dirty = True
+        self._dirty_namespaces.add(namespace)
+        self._dirty_operations[namespace] = operation
+        if ENABLED and not was_dirty:
+            LOGGER.info(
+                "[Storage] dirty transition clean_to_dirty namespace=%s operation=%s",
+                namespace,
+                operation,
+            )
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         return {namespace: dict(values) for namespace, values in self._ensure_decoded().items()}
@@ -297,7 +395,12 @@ class JsonProjectStorage(ProjectStorageAdapter):
     @staticmethod
     def _validate_payload(payload: bytes) -> None:
         decoded = json.loads(payload.decode("utf-8"))
-        if not isinstance(decoded, dict):
+        JsonProjectStorage._validate_document(decoded)
+
+    @staticmethod
+    def _validate_document(document: object) -> None:
+        """Vérifie l'invariant de racine avant sérialisation, sans reparse coûteux."""
+        if not isinstance(document, dict):
             raise ValueError("Le contenu d'un projet JSON doit etre un mapping.")
 
     @staticmethod
@@ -356,6 +459,56 @@ class JsonProjectStorage(ProjectStorageAdapter):
             or payload.get("storage") != self.FILE_NAME
         ):
             raise ValueError(f"Fichier projet incompatible : {self._entry_file}")
+
+
+def _bounded_structural_diff(previous: object, current: object, *, limit: int = 24) -> list[str]:
+    """Décrit un écart de persistance sans journaliser une charge complète.
+
+    Ce diagnostic ne sert qu'à expliquer une transition clean → dirty. Les
+    champs binaires et les collections potentiellement massives sont donc
+    réduits à leur chemin et à une représentation courte de leur valeur.
+    """
+    changes: list[str] = []
+
+    def visit(path: str, left: object, right: object) -> None:
+        if len(changes) >= limit or left == right:
+            return
+        if is_dataclass(left) and is_dataclass(right) and type(left) is type(right):
+            for item in fields(left):
+                visit(f"{path}.{item.name}" if path else item.name, getattr(left, item.name), getattr(right, item.name))
+            return
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            for key in sorted(set(left) | set(right), key=str):
+                key_path = f"{path}.{key}" if path else str(key)
+                visit(key_path, left.get(key, _MISSING), right.get(key, _MISSING))
+                if len(changes) >= limit:
+                    return
+            return
+        if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)) and len(left) == len(right):
+            for index, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
+                visit(f"{path}[{index}]", left_item, right_item)
+                if len(changes) >= limit:
+                    return
+            return
+        changes.append(f"{path}: {_short_value(left)} -> {_short_value(right)}")
+
+    visit("", previous, current)
+    if len(changes) == limit:
+        changes.append("…")
+    return changes
+
+
+def _short_value(value: object, *, maximum: int = 96) -> str:
+    if value is _MISSING:
+        return "<absent>"
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, Mapping):
+        return f"<{type(value).__name__}:{len(value)}>"
+    if isinstance(value, (tuple, list, frozenset, set)):
+        return f"<{type(value).__name__}:{len(value)}>"
+    text = repr(value)
+    return text if len(text) <= maximum else f"{text[:maximum - 1]}…"
 
 
 def _encode(value: Any, codecs: ProjectCodecRegistry) -> Any:

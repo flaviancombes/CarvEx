@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from project.codecs import create_core_codec_registry
+from project.models import ProjectManifest
+from project.repository import ProjectRepository
 from project.storage import JsonProjectStorage, ProjectStorageCorruptionError
 
 
@@ -104,3 +106,33 @@ def test_legacy_project_without_checksum_opens_and_receives_protection_on_next_s
     assert (root / JsonProjectStorage.CHECKSUM_FILE_NAME).is_file()
     assert (root / JsonProjectStorage.BACKUP_FILE_NAME).is_file()
     assert _storage(root).read("samples", "next") == "protected"
+
+
+def test_flush_does_not_reparse_the_json_payload_it_just_serialized(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "validated-in-memory.carvex"
+    storage = _storage(root, create=True)
+    storage.write("samples", "value", "first")
+
+    def parsing_is_not_a_flush_validation(*_args, **_kwargs):
+        raise AssertionError("Le flush ne doit pas reparser son propre JSON.")
+
+    monkeypatch.setattr("project.storage.json.loads", parsing_is_not_a_flush_validation)
+    storage.flush()
+
+    assert (root / JsonProjectStorage.FILE_NAME).is_file()
+
+
+def test_repository_does_not_mark_unchanged_core_data_dirty(tmp_path) -> None:
+    root = tmp_path / "unchanged-core.carvex"
+    storage = _storage(root, create=True)
+    repository = ProjectRepository(storage)
+    manifest = ProjectManifest()
+    repository.save_manifest(manifest)
+    repository.flush()
+    payload_before = (root / JsonProjectStorage.FILE_NAME).read_bytes()
+
+    repository.save_manifest(manifest)
+
+    assert not repository.is_dirty
+    repository.flush()
+    assert (root / JsonProjectStorage.FILE_NAME).read_bytes() == payload_before

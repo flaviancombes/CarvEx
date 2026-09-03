@@ -38,13 +38,36 @@ class WorkspaceController:
         self._bookmarks_view = bookmarks_view
         self._investigation_panel = investigation_panel
         self._details_panel = details_panel
+        self._default_workspace_snapshot: Workspace | None = None
+        self._restoring_splitter = False
+        self._splitter_was_moved_by_user = False
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
 
     def capture(self) -> None:
         project = self._project_manager.active_project
         if project is None:
             return
         current = project.workspaces.get(project.state.active_workspace_id, Workspace("default", "Espace principal"))
-        workspace = replace(
+        workspace = self._workspace_from_ui(current)
+        if current.splitter_sizes and not self._splitter_was_moved_by_user:
+            # QSplitter conserve la proportion pendant les redimensionnements
+            # de son conteneur et ``sizes()`` devient alors une matérialisation
+            # dépendante de la géométrie courante. Sans déplacement explicite
+            # de poignée, la valeur persistée reste la dernière intention
+            # utilisateur.
+            workspace = replace(workspace, splitter_sizes=current.splitter_sizes)
+        # Un workspace historique vide signifie « utiliser les réglages Qt par
+        # défaut ». Le premier état capturé après restauration décrit ces mêmes
+        # réglages, mais sous leur représentation explicite (headers, tailles,
+        # filtres). Il ne doit pas réécrire un projet propre. Toute divergence
+        # ultérieure de cette référence correspond en revanche à une action
+        # utilisateur persistable.
+        if self._default_workspace_snapshot == workspace:
+            return
+        self._project_manager.workspace_manager.save(workspace)
+
+    def _workspace_from_ui(self, current: Workspace) -> Workspace:
+        return replace(
             current,
             active_tab=self._TAB_IDS[self._tabs.currentIndex()],
             splitter_sizes=tuple(self._splitter.sizes()),
@@ -88,12 +111,13 @@ class WorkspaceController:
                 "timeline_view": self._timeline_view.search.text(),
             },
         )
-        self._project_manager.workspace_manager.save(workspace)
 
     def restore(self) -> None:
         project = self._project_manager.active_project
         if project is None:
             return
+        self._default_workspace_snapshot = None
+        self._splitter_was_moved_by_user = False
         workspace = project.workspaces.get(project.state.active_workspace_id)
         splitter_sizes = (
             workspace.splitter_sizes
@@ -117,10 +141,44 @@ class WorkspaceController:
         self._tabs.setCurrentIndex(
             self._TAB_IDS.index(workspace.active_tab) if workspace.active_tab in self._TAB_IDS else 0
         )
+        if self._is_unconfigured_default_workspace(workspace):
+            QTimer.singleShot(0, self._capture_default_workspace_snapshot)
+
+    def _capture_default_workspace_snapshot(self) -> None:
+        project = self._project_manager.active_project
+        if project is None:
+            return
+        current = project.workspaces.get(project.state.active_workspace_id)
+        if current is not None and self._is_unconfigured_default_workspace(current):
+            self._default_workspace_snapshot = self._workspace_from_ui(current)
+
+    @staticmethod
+    def _is_unconfigured_default_workspace(workspace: Workspace) -> bool:
+        return (
+            workspace.active_tab == "files_view"
+            and not workspace.splitter_sizes
+            and not workspace.header_states
+            and not workspace.columns_by_view
+            and not workspace.sort_by_view
+            and not workspace.filters_by_view
+            and not workspace.searches_by_view
+            and not workspace.opened_panels
+        )
 
     def _restore_splitter_sizes(self, sizes: tuple[int, ...]) -> None:
-        self._splitter.setSizes(list(sizes))
-        QTimer.singleShot(0, lambda: self._splitter.setSizes(list(sizes)))
+        def apply_sizes() -> None:
+            self._restoring_splitter = True
+            try:
+                self._splitter.setSizes(list(sizes))
+            finally:
+                self._restoring_splitter = False
+
+        apply_sizes()
+        QTimer.singleShot(0, apply_sizes)
+
+    def _on_splitter_moved(self, _position: int, _index: int) -> None:
+        if not self._restoring_splitter:
+            self._splitter_was_moved_by_user = True
 
     @staticmethod
     def view_header(view):

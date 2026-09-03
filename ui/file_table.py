@@ -37,6 +37,7 @@ from ui.file_actions import FileActions
 from ui.file_filter_proxy import FileFilterProxyModel
 from ui.investigation_context_menu import append_investigation_actions
 from ui.metadata_filter_panel import MetadataFilterPanel
+from utils import performance
 
 
 class _FileSelectionDelegate(QStyledItemDelegate):
@@ -240,26 +241,29 @@ class FileTable(QWidget):
         return container
 
     def _apply_category_filter(self, button_id: int) -> None:
-        self._remember_current_file()
-        button = self.category_group.button(button_id)
-        self._proxy_model.set_category(str(button.property("category")))
-        self._emit_view_state()
-        self._restore_last_selection()
+        with performance.operation("FileTable", "category_filter"):
+            self._remember_current_file()
+            button = self.category_group.button(button_id)
+            self._proxy_model.set_category(str(button.property("category")))
+            self._emit_view_state()
+            self._restore_last_selection()
 
     def _apply_artifact_filter(self, _index: int) -> None:
-        self._remember_current_file()
-        artifact_filter = str(self.artifact_filter.currentData() or "")
-        self._proxy_model.set_artifact_filter(artifact_filter)
-        if artifact_filter and self._artifact_preloader is not None:
-            self._artifact_preloader.preload(self._records)
-        self._emit_view_state()
-        self._restore_last_selection()
+        with performance.operation("FileTable", "artifact_filter"):
+            self._remember_current_file()
+            artifact_filter = str(self.artifact_filter.currentData() or "")
+            self._proxy_model.set_artifact_filter(artifact_filter)
+            if artifact_filter and self._artifact_preloader is not None:
+                self._artifact_preloader.preload(self._records)
+            self._emit_view_state()
+            self._restore_last_selection()
 
     def _apply_duplicates_filter(self, enabled: bool) -> None:
-        self._remember_current_file()
-        self._proxy_model.set_duplicates_only(enabled)
-        self._emit_view_state()
-        self._restore_last_selection()
+        with performance.operation("FileTable", "duplicates_filter"):
+            self._remember_current_file()
+            self._proxy_model.set_duplicates_only(enabled)
+            self._emit_view_state()
+            self._restore_last_selection()
 
     def refresh_artifact_filter(self, file_ids: Sequence[str]) -> None:
         """Réévalue uniquement les lignes dont le cache d'artefacts vient d'être rempli."""
@@ -283,12 +287,13 @@ class FileTable(QWidget):
         self._investigation_item_lookup = lookup
 
     def _set_search_text(self, text: str) -> None:
-        self._remember_current_file()
-        metadata_matches = self._metadata_index.search(text) if self._metadata_index else frozenset()
-        correlation_matches = self.correlation_filters.search_matches(text)
-        self._proxy_model.set_universal_search(text, metadata_matches | correlation_matches)
-        self._emit_view_state()
-        self._restore_last_selection()
+        with performance.operation("FileTable", "universal_search"):
+            self._remember_current_file()
+            metadata_matches = self._metadata_index.search(text) if self._metadata_index else frozenset()
+            correlation_matches = self.correlation_filters.search_matches(text)
+            self._proxy_model.set_universal_search(text, metadata_matches | correlation_matches)
+            self._emit_view_state()
+            self._restore_last_selection()
 
     def set_metadata_index(self, index: MetadataIndex | None) -> None:
         """Makes the persistent metadata index available to the filters only."""
@@ -345,9 +350,10 @@ class FileTable(QWidget):
 
     def refresh_metadata_filters(self) -> None:
         """Re-evaluates the active immutable query after an index batch commit."""
-        self.metadata_filters.refresh_index()
-        self._proxy_model.refresh_metadata_query()
-        self._emit_view_state()
+        with performance.operation("FileTable", "refresh_metadata_filters"):
+            self.metadata_filters.refresh_index()
+            self._proxy_model.refresh_metadata_query()
+            self._emit_view_state()
 
     def _emit_view_state(self) -> None:
         """Diffère le comptage afin de ne pas forcer le proxy juste après son invalidation."""

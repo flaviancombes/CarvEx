@@ -29,6 +29,10 @@ class TimelineService:
     def start_build(self, *, retain_events: bool = True):
         return self.repository.start_build(retain_events=retain_events)
 
+    @property
+    def record_count(self) -> int:
+        return self.repository.record_count
+
 
 def build_default_service(metadata_manager: MetadataManager) -> TimelineService:
     return TimelineService(build_default_manager(metadata_manager))

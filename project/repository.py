@@ -9,7 +9,7 @@ from project.codecs import ProjectCodecRegistry
 from project.models import ProjectManifest, ProjectMetadata, ProjectSettings, ProjectState, Workspace
 from project.storage import ProjectStorageAdapter
 from project.stores import ProjectStore
-from utils.performance import pipeline_stage
+from utils.performance import ENABLED, LOGGER, pipeline_stage
 
 if TYPE_CHECKING:
     pass
@@ -45,28 +45,28 @@ class ProjectRepository:
         return self._storage.read(self.CORE_NAMESPACE, "manifest")
 
     def save_manifest(self, manifest: ProjectManifest) -> None:
-        self._storage.write(self.CORE_NAMESPACE, "manifest", manifest)
+        self._write_if_changed(self.CORE_NAMESPACE, "manifest", manifest)
 
     def load_metadata(self) -> ProjectMetadata | None:
         return self._storage.read(self.CORE_NAMESPACE, "metadata")
 
     def save_metadata(self, metadata: ProjectMetadata) -> None:
-        self._storage.write(self.CORE_NAMESPACE, "metadata", metadata)
+        self._write_if_changed(self.CORE_NAMESPACE, "metadata", metadata)
 
     def load_settings(self) -> ProjectSettings | None:
         return self._storage.read(self.CORE_NAMESPACE, "settings")
 
     def save_settings(self, settings: ProjectSettings) -> None:
-        self._storage.write(self.CORE_NAMESPACE, "settings", settings)
+        self._write_if_changed(self.CORE_NAMESPACE, "settings", settings)
 
     def load_state(self) -> ProjectState | None:
         return self._storage.read(self.CORE_NAMESPACE, "state")
 
     def save_state(self, state: ProjectState) -> None:
-        self._storage.write(self.CORE_NAMESPACE, "state", state)
+        self._write_if_changed(self.CORE_NAMESPACE, "state", state)
 
     def save_workspace(self, workspace: Workspace) -> None:
-        self._storage.write("workspaces", workspace.workspace_id, workspace)
+        self._write_if_changed("workspaces", workspace.workspace_id, workspace)
 
     def load_workspaces(self) -> dict[str, Workspace]:
         return {
@@ -93,8 +93,29 @@ class ProjectRepository:
         return self._storage.is_dirty
 
     def flush(self) -> None:
+        self.log_dirty_state("before_flush")
         with pipeline_stage("ProjectStorage.flush"):
             self._storage.flush()
+
+    def log_dirty_state(self, stage: str) -> None:
+        """Journalise les dirty flags sans parcourir les données du projet."""
+        if not ENABLED:
+            return
+        dirty, namespaces, operations = self._storage.dirty_details()
+        LOGGER.info(
+            "[Storage] dirty_state stage=%s repository=%s storage=%s dirty_namespaces=%s dirty_operations=%s",
+            stage,
+            self.is_dirty,
+            dirty,
+            list(namespaces),
+            list(operations),
+        )
+
+    def _write_if_changed(self, namespace: str, key: str, value: object) -> None:
+        """Évite de rendre le projet dirty pour un objet cœur strictement identique."""
+        existing = self._storage.read(namespace, key, _MISSING)
+        if existing != value:
+            self._storage.write(namespace, key, value)
 
     def snapshot(self):
         return self._storage.snapshot()
@@ -114,3 +135,6 @@ class ProjectRepository:
         """
         root = getattr(self._storage, "root", None)
         return root if isinstance(root, Path) else None
+
+
+_MISSING = object()

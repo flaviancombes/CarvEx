@@ -42,6 +42,7 @@ from selection.resolver import FileSelectionRegistry, FileSelectionResolver
 from timeline.service import build_default_service
 from ui.application_navigation import ApplicationNavigationController, EvidenceWorkflowController
 from ui.artifact_preloader import ArtifactPreloader
+from ui.background_activity import BackgroundActivityIndicator, BackgroundTaskRegistry
 from ui.bookmarks_view import BookmarksView
 from ui.details_panel import DetailsPanel
 from ui.file_table import FileTable
@@ -51,6 +52,10 @@ from ui.project_home import ProjectHome
 from ui.project_session_controller import ProjectSessionController
 from ui.project_workflow_controller import ProjectWorkflowController
 from ui.timeline_view import TimelineView
+from ui.ui_responsiveness_instrumentation import (
+    start_global_ui_event_loop_monitor,
+    stop_global_ui_event_loop_monitor,
+)
 from ui.workspace_controller import WorkspaceController
 
 
@@ -80,6 +85,7 @@ class MainWindow(QMainWindow):
         self._entity_resolver = CanonicalEntityResolver(self._selection_registry)
         self._selection_resolver = FileSelectionResolver(self._selection_registry)
         self.duplicate_index = DuplicateIndex()
+        self.background_tasks = BackgroundTaskRegistry(self)
 
         self._create_actions()
         self._create_central_area()
@@ -87,6 +93,7 @@ class MainWindow(QMainWindow):
         self._compose_controllers()
         self._create_menu_bar()
         self._create_tool_bar()
+        start_global_ui_event_loop_monitor(self)
         self.project_manager.dirty_changed.connect(lambda _dirty: self._refresh_project_ui())
         self.project_manager.project_closed.connect(self.file_selection.clear)
         self._show_home()
@@ -157,6 +164,7 @@ class MainWindow(QMainWindow):
             self,
             entity_resolver=self._entity_resolver,
             file_selection=self.file_selection,
+            background_tasks=self.background_tasks,
         )
         self._entity_resolver.set_timeline_event_lookup(self.timeline_view.event_for_id)
         self.bookmarks_view = BookmarksView(self.bookmark_service, self, self._entity_resolver)
@@ -227,6 +235,7 @@ class MainWindow(QMainWindow):
             self.timeline_view,
             self.bookmarks_view,
             self._artifact_preloader,
+            self.background_tasks,
             self._workspace_controller,
             self.application_stack,
             self.content_splitter,
@@ -365,6 +374,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._prepare_project_change():
+            stop_global_ui_event_loop_monitor()
             super().closeEvent(event)
         else:
             event.ignore()
@@ -477,6 +487,7 @@ class MainWindow(QMainWindow):
         self.modules_status = QLabel("0 module actif", self)
         self.correlations_status = QLabel("0 fichier corrélé", self)
         self.runtime_status = QLabel("0 sélectionné — 0 s", self)
+        self.background_activity = BackgroundActivityIndicator(self.background_tasks, self)
         for widget in (
             self.project_status,
             self.files_status,
@@ -489,6 +500,7 @@ class MainWindow(QMainWindow):
         ):
             widget.setContentsMargins(8, 0, 8, 0)
             self.statusBar().addPermanentWidget(widget)
+        self.statusBar().addPermanentWidget(self.background_activity, 1)
 
     def _set_report_status(self, count: int, visible: int) -> None:
         self.files_status.setText(f"{count} fichier" if count == 1 else f"{count} fichiers")

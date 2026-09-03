@@ -21,6 +21,7 @@ from project.modules import ProjectModuleContext, ProjectModuleRegistry
 from project.repository import ProjectRepository
 from project.storage import InMemoryProjectStorage, JsonProjectStorage, ProjectStorageAdapter
 from project.workspaces import WorkspaceManager
+from utils.performance import ENABLED, LOGGER, measure, operation
 
 
 class ProjectManager(QObject):
@@ -89,14 +90,13 @@ class ProjectManager(QObject):
                 raise ValueError("Projet créé avec un schéma plus récent : ouverture lecture seule à implémenter.")
             manifest = self._activate_available_modules(self._migrate_manifest(repository, manifest))
             project = Project(
-                manifest=replace(manifest, clean_shutdown=False),
+                manifest=manifest,
                 metadata=metadata,
                 settings=repository.load_settings() or ProjectSettings(),
                 state=repository.load_state() or ProjectState(),
                 repository=repository,
                 workspaces=repository.load_workspaces(),
             )
-            repository.save_manifest(project.manifest)
             for module in self._modules.enabled(project.manifest.enabled_modules):
                 context = ProjectModuleContext(
                     project.manifest.project_id, repository, module.descriptor, project.manifest.capabilities
@@ -189,6 +189,11 @@ class ProjectManager(QObject):
     def is_dirty(self) -> bool:
         return bool(self._active_project and self._active_project.repository.is_dirty)
 
+    def log_dirty_state(self, stage: str) -> None:
+        """Exporte le diagnostic du backend actif, uniquement en mode performance."""
+        if self._active_project is not None:
+            self._active_project.repository.log_dirty_state(stage)
+
     def save_project(self) -> None:
         project = self._require_active()
         for module in self._modules.enabled(project.manifest.enabled_modules):
@@ -199,7 +204,6 @@ class ProjectManager(QObject):
         for workspace in project.workspaces.values():
             project.repository.save_workspace(workspace)
         project.repository.save_state(project.state)
-        project.repository.save_manifest(replace(project.manifest, clean_shutdown=False))
         project.repository.flush()
         self.dirty_changed.emit(False)
 
@@ -227,29 +231,47 @@ class ProjectManager(QObject):
         project = self._active_project
         if project is None:
             return
+        if ENABLED:
+            LOGGER.info("[Shutdown] project teardown save=%s dirty=%s", save, project.repository.is_dirty)
+        project.repository.log_dirty_state("close_start")
         if save:
-            for module in self._modules.enabled(project.manifest.enabled_modules):
+            with measure("shutdown.modules_save"), operation("Shutdown", "modules_save"):
+                for module in self._modules.enabled(project.manifest.enabled_modules):
+                    context = ProjectModuleContext(
+                        project.manifest.project_id,
+                        project.repository,
+                        module.descriptor,
+                        project.manifest.capabilities,
+                    )
+                    module.save(context)
+                    project.repository.log_dirty_state(f"after_module_save:{module.descriptor.module_id}")
+        with measure("shutdown.project_closing_signal"), operation("Shutdown", "project_closing_signal"):
+            self.project_closing.emit(project)
+        project.repository.log_dirty_state("after_project_closing_signal")
+        with measure("shutdown.modules_close"), operation("Shutdown", "modules_close"):
+            for module in reversed(self._modules.enabled(project.manifest.enabled_modules)):
                 context = ProjectModuleContext(
                     project.manifest.project_id, project.repository, module.descriptor, project.manifest.capabilities
                 )
-                module.save(context)
-        self.project_closing.emit(project)
-        for module in reversed(self._modules.enabled(project.manifest.enabled_modules)):
-            context = ProjectModuleContext(
-                project.manifest.project_id, project.repository, module.descriptor, project.manifest.capabilities
-            )
-            module.close(context)
+                module.close(context)
+                project.repository.log_dirty_state(f"after_module_close:{module.descriptor.module_id}")
         if save:
             # Workspace is deliberately excluded from the dirty indicator, but
-            # must still survive a normal close.
-            for workspace in project.workspaces.values():
-                project.repository.save_workspace(workspace)
-            project.repository.save_state(project.state)
-            project.manifest = replace(project.manifest, clean_shutdown=True)
-            project.repository.save_manifest(project.manifest)
-            project.repository.flush()
+            # must still survive a normal close. The project lock is the session
+            # marker: it is released only after this flush succeeds. Updating
+            # ``clean_shutdown`` in the monolithic manifest would otherwise
+            # rewrite an unchanged multi-gigabyte project solely for a flag that
+            # is not consumed by project recovery.
+            with measure("shutdown.persist_core"), operation("Shutdown", "persist_core"):
+                for workspace in project.workspaces.values():
+                    project.repository.save_workspace(workspace)
+                project.repository.save_state(project.state)
+            project.repository.log_dirty_state("after_persist_core")
+            with measure("shutdown.repository_flush"), operation("Shutdown", "repository_flush"):
+                project.repository.flush()
         self._active_project = None
-        project.repository.close()
+        with measure("shutdown.project_lock_release"), operation("Shutdown", "project_lock_release"):
+            project.repository.close()
         self.dirty_changed.emit(False)
         self.project_closed.emit()
 

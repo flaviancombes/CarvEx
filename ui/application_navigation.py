@@ -19,6 +19,7 @@ from selection.canonical_entity_resolver import CanonicalEntityResolver
 from selection.context import SelectionContext
 from selection.manager import SelectionManager
 from selection.resolver import FileSelectionRegistry
+from utils import performance
 
 
 class ApplicationNavigationController:
@@ -204,7 +205,10 @@ class EvidenceWorkflowController:
         service = self._investigation_panel.service
         if service is None:
             return
-        result = service.create_items_batch(tuple(InvestigationTargetRef("file", file_id) for file_id in identifiers))
+        with performance.operation("Investigation", "add_files_bulk"):
+            result = service.create_items_batch(
+                tuple(InvestigationTargetRef("file", file_id) for file_id in identifiers)
+            )
         self._after_bulk_change(identifiers, result.applied_count, "preuve(s) ajoutée(s) à Investigation.")
 
     def add_files_to_collection_bulk(self, file_ids: Iterable[str]) -> None:
@@ -231,9 +235,10 @@ class EvidenceWorkflowController:
         if not accepted:
             return
         collection = next(collection for collection in collections if collection.title == selected)
-        result = service.add_files_to_collection_batch(
-            InvestigationCollectionId(str(collection.collection_id)), identifiers
-        )
+        with performance.operation("Investigation", "add_files_to_collection_bulk"):
+            result = service.add_files_to_collection_batch(
+                InvestigationCollectionId(str(collection.collection_id)), identifiers
+            )
         self._after_bulk_change(identifiers, result.applied_count, "fichier(s) ajouté(s) à la Collection.")
 
     def _after_bulk_change(self, file_ids: tuple[str, ...], applied_count: int, message: str) -> None:

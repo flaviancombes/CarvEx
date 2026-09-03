@@ -27,6 +27,7 @@ from utils.performance import (
     IndexingCompletionReport,
     finish_pipeline_profile,
     log_cache_sizes,
+    measure,
     pipeline_stage,
     start_pipeline_profile,
 )
@@ -50,6 +51,7 @@ class ProjectSessionController:
         timeline_view,
         bookmarks_view,
         artifact_preloader,
+        background_tasks,
         workspace_controller,
         application_stack,
         content_widget,
@@ -74,6 +76,7 @@ class ProjectSessionController:
         self._timeline_view = timeline_view
         self._bookmarks_view = bookmarks_view
         self._artifact_preloader = artifact_preloader
+        self._background_tasks = background_tasks
         self._workspace_controller = workspace_controller
         self._application_stack = application_stack
         self._content_widget = content_widget
@@ -108,19 +111,23 @@ class ProjectSessionController:
 
     def clear(self) -> None:
         stop_ui_responsiveness_probe()
-        self._stop_metadata_indexing()
-        self._artifact_preloader.clear_cache()
-        self._bookmark_service.attach_repository(InMemoryBookmarkRepository())
-        self._file_table.set_metadata_index(None)
-        self._file_table.set_correlation_index(None)
-        self._details_panel.set_correlation_index(None)
-        self._investigation_panel.detach()
+        with measure("shutdown.session_stop_metadata"), performance.operation("Shutdown", "session_stop_metadata"):
+            self._stop_metadata_indexing()
+        with measure("shutdown.session_detach_views"), performance.operation("Shutdown", "session_detach_views"):
+            self._artifact_preloader.clear_cache()
+            self._bookmark_service.attach_repository(InMemoryBookmarkRepository())
+            self._file_table.set_metadata_index(None)
+            self._file_table.set_correlation_index(None)
+            self._details_panel.set_correlation_index(None)
+            self._investigation_panel.detach()
         self._physical_representation = None
+        self._background_tasks.finish_all(cancelled=True)
         self._entity_resolver.set_investigation_item_lookup(None)
         if self._details_provider is not None:
             self._details_panel.unregister_provider(self._details_provider)
             self._details_provider = None
-        self.reset_views()
+        with measure("shutdown.session_reset_views"), performance.operation("Shutdown", "session_reset_views"):
+            self.reset_views()
         self.show_home()
 
     def reset_views(self) -> None:
@@ -214,6 +221,13 @@ class ProjectSessionController:
             self._metadata_manager.set_store_writable(True)
             raise
         if self._metadata_indexing.is_running:
+            progress = self._metadata_indexing.progress
+            self._background_tasks.start_task(
+                "metadata",
+                "Indexation des métadonnées",
+                total=progress.total,
+                current=progress.indexed + progress.failed,
+            )
             self._metadata_timer.start()
             self._show_metadata_progress()
         else:
@@ -229,13 +243,17 @@ class ProjectSessionController:
             report = IndexingCompletionReport()
             with (
                 report.stage("Attente des derniers workers / file de commits"),
+                performance.operation("MetadataIndexing", "collect_completed"),
                 pipeline_stage("MetadataIndexingService.collect_completed"),
             ):
                 completed = indexing.collect_completed()
             committed = False
             with report.stage("MetadataCommitService (derniers lots)"):
                 for result in completed:
-                    with pipeline_stage("MetadataCommitService.commit"):
+                    with (
+                        performance.operation("MetadataIndexing", "commit_batch"),
+                        pipeline_stage("MetadataCommitService.commit"),
+                    ):
                         commit.commit(result)
                     committed = True
             if committed:
@@ -254,7 +272,11 @@ class ProjectSessionController:
         if not indexing.is_running and not indexing.has_completed:
             self._metadata_timer.stop()
             self._metadata_manager.set_store_writable(True)
-            self._finalize_metadata_indexing(report)
+            self._background_tasks.set_phase("metadata", "Finalisation de l’indexation des métadonnées…")
+            try:
+                self._finalize_metadata_indexing(report)
+            finally:
+                self._background_tasks.finish_task("metadata")
 
     def _stop_metadata_indexing(self, *_args) -> None:
         self._metadata_timer.stop()
@@ -262,12 +284,31 @@ class ProjectSessionController:
         commit = self._metadata_commit
         if indexing is None:
             return
-        indexing.shutdown()
+        progress = indexing.progress
+        if performance.ENABLED:
+            performance.LOGGER.info(
+                "[Shutdown] metadata workers active_records=%d completed=%s",
+                progress.indexing,
+                indexing.has_completed,
+            )
+        with measure("shutdown.metadata_workers_stop"), performance.operation("Shutdown", "metadata_workers_stop"):
+            indexing.shutdown()
         if commit is not None:
-            for result in indexing.collect_completed():
-                commit.commit(result)
+            with (
+                measure("shutdown.metadata_collect_completed"),
+                performance.operation("Shutdown", "metadata_collect_completed"),
+            ):
+                completed = indexing.collect_completed()
+            if completed:
+                with (
+                    measure("shutdown.metadata_commit_completed"),
+                    performance.operation("Shutdown", "metadata_commit_completed"),
+                ):
+                    for result in completed:
+                        commit.commit(result)
                 self._metadata_correlations_dirty = True
-            self._finalize_metadata_indexing()
+            if self._metadata_correlations_dirty:
+                self._finalize_metadata_indexing(for_shutdown=bool(_args))
         self._metadata_manager.set_store_writable(True)
         self._metadata_indexing = None
         self._metadata_commit = None
@@ -275,8 +316,14 @@ class ProjectSessionController:
         self._correlation_engine = None
         self._correlation_store = None
         self._metadata_correlations_dirty = False
+        self._background_tasks.finish_task("metadata", cancelled=True)
 
-    def _finalize_metadata_indexing(self, report: IndexingCompletionReport | None = None) -> None:
+    def _finalize_metadata_indexing(
+        self,
+        report: IndexingCompletionReport | None = None,
+        *,
+        for_shutdown: bool = False,
+    ) -> None:
         """Build derived correlations once, then persist the coherent checkpoint."""
         commit = self._metadata_commit
         if commit is None:
@@ -289,15 +336,20 @@ class ProjectSessionController:
             if engine is not None and store is not None:
                 with (
                     report.stage("Génération des corrélations"),
+                    performance.operation("MetadataCorrelation", "build_and_store"),
                     pipeline_stage("MetadataCorrelationEngine.build_and_store"),
                 ):
                     engine.build_and_store(store)
-                with report.stage("Rafraîchissement FileTable (corrélations)"):
-                    self._file_table.set_correlation_index(store.index)
-                with report.stage("Rafraîchissement DetailsPanel (corrélations)"):
-                    self._details_panel.set_correlation_index(store.index, self._file_table.file_label_for)
+                if not for_shutdown:
+                    with report.stage("Rafraîchissement FileTable (corrélations)"):
+                        self._file_table.set_correlation_index(store.index)
+                    with report.stage("Rafraîchissement DetailsPanel (corrélations)"):
+                        self._details_panel.set_correlation_index(store.index, self._file_table.file_label_for)
             self._metadata_correlations_dirty = False
-        with pipeline_stage("MetadataCommitService.flush_pending"):
+        with (
+            performance.operation("MetadataIndexing", "flush_pending"),
+            pipeline_stage("MetadataCommitService.flush_pending"),
+        ):
             commit.flush_pending(report.record_elapsed)
         mark_pipeline_finished()
         finish_pipeline_profile()
@@ -308,6 +360,12 @@ class ProjectSessionController:
         if self._metadata_indexing is None:
             return
         progress = self._metadata_indexing.progress
+        self._background_tasks.update_task(
+            "metadata",
+            current=progress.indexed + progress.failed,
+            total=progress.total,
+            label="Indexation des métadonnées",
+        )
         if progress.percentage >= 100:
             start_pipeline_profile("Pipeline metadata après progression 100 %")
         self._show_status(
