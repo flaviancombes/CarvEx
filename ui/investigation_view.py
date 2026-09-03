@@ -50,6 +50,7 @@ from ui.investigation_dialogs import (
 from ui.investigation_drag_drop import InvestigationDragDropPolicy
 from ui.investigation_evidence import InvestigationEvidenceWorkflow
 from ui.investigation_journal_formatter import InvestigationJournalFormatter
+from utils import performance
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +79,10 @@ class InvestigationTreeView(QTreeView):
     def __init__(self, model: InvestigationTreeModel, parent=None) -> None:
         super().__init__(parent)
         self.setModel(model)
-        self.setHeaderHidden(True)
+        self.setHeaderHidden(False)
+        self.header().setStretchLastSection(False)
+        self.setColumnWidth(0, 300)
+        self.setColumnWidth(1, 170)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -478,16 +482,21 @@ class InvestigationController(QObject):
         if not isinstance(event, InvestigationEvent):
             return
         if event.event_type is EventType.BATCH_COMPLETED:
-            if event.parent_kind == "items" and self._model.is_loaded(InvestigationSection.ITEMS):
-                self.refresh_section(InvestigationSection.ITEMS)
-            elif event.parent_kind == "collection":
-                if self._model.is_loaded(InvestigationSection.COLLECTIONS):
-                    self.refresh_section(InvestigationSection.COLLECTIONS)
-                if self._model.is_loaded(InvestigationSection.ITEMS):
-                    self.refresh_section(InvestigationSection.ITEMS)
-            if self._model.is_loaded(InvestigationSection.JOURNAL):
-                self.refresh_section(InvestigationSection.JOURNAL)
-            self.item_presence_changed.emit(self._has_tree_content())
+            with performance.measure("InvestigationController.batch_event", parent_kind=event.parent_kind or ""):
+                if event.parent_kind == "items" and self._model.is_loaded(InvestigationSection.ITEMS):
+                    with performance.measure("InvestigationController.refresh_items"):
+                        self.refresh_section(InvestigationSection.ITEMS)
+                elif event.parent_kind == "collection":
+                    if self._model.is_loaded(InvestigationSection.COLLECTIONS):
+                        with performance.measure("InvestigationController.refresh_collections"):
+                            self.refresh_section(InvestigationSection.COLLECTIONS)
+                    if self._model.is_loaded(InvestigationSection.ITEMS):
+                        with performance.measure("InvestigationController.refresh_items"):
+                            self.refresh_section(InvestigationSection.ITEMS)
+                if self._model.is_loaded(InvestigationSection.JOURNAL):
+                    with performance.measure("InvestigationController.refresh_journal"):
+                        self.refresh_section(InvestigationSection.JOURNAL)
+                self.item_presence_changed.emit(self._has_tree_content())
             return
         section = self._SECTIONS_BY_EVENT.get(event.event_type)
         if section is None and event.event_type in {EventType.MEMBERSHIP_ADDED, EventType.MEMBERSHIP_REMOVED}:
@@ -538,6 +547,7 @@ class InvestigationController(QObject):
                     f"📄 {item.title or item.subject_kind}",
                     item.status.value,
                     related_target_ref=InvestigationTargetRef(item.subject_kind, item.subject_id),
+                    added_at=item.created_at,
                 )
                 for item in self._service.list_items()
             )

@@ -44,6 +44,8 @@ class ProjectManager(QObject):
         for module in self._modules.enabled():
             module.register_codecs(self._codecs)
         self._active_project: Project | None = None
+        self._background_save_repository: ProjectRepository | None = None
+        self._background_close_project: Project | None = None
         self.workspace_manager = WorkspaceManager(self, self)
 
     @property
@@ -195,17 +197,88 @@ class ProjectManager(QObject):
             self._active_project.repository.log_dirty_state(stage)
 
     def save_project(self) -> None:
+        self._ensure_no_background_save()
         project = self._require_active()
-        for module in self._modules.enabled(project.manifest.enabled_modules):
-            context = ProjectModuleContext(
-                project.manifest.project_id, project.repository, module.descriptor, project.manifest.capabilities
-            )
-            module.save(context)
-        for workspace in project.workspaces.values():
-            project.repository.save_workspace(workspace)
-        project.repository.save_state(project.state)
+        self._save_modules(project)
+        self._persist_core(project)
         project.repository.flush()
         self.dirty_changed.emit(False)
+
+    def begin_background_save(self) -> ProjectRepository | None:
+        """Prépare en MainThread un flush exclusif à exécuter hors UI.
+
+        Les modules, les workspaces Qt déjà capturés et les stores restent
+        traités ici. Le repository retourné ne doit ensuite plus recevoir
+        d'écriture jusqu'à :meth:`finish_background_save`.
+        """
+        self._ensure_no_background_save()
+        project = self._require_active()
+        self._save_modules(project)
+        self._persist_core(project)
+        if not project.repository.is_dirty:
+            return None
+        project.repository.begin_background_flush()
+        self._background_save_repository = project.repository
+        if ENABLED:
+            LOGGER.info("[Save] background flush prepared close=False")
+        return project.repository
+
+    def begin_background_close(self) -> ProjectRepository | None:
+        """Prépare un snapshot stable, sans invalider les modules encore visibles."""
+        self._ensure_no_background_save()
+        project = self._require_active()
+        if ENABLED:
+            LOGGER.info("[Shutdown] background close preparation dirty=%s", project.repository.is_dirty)
+        self._save_modules(project)
+        self.project_closing.emit(project)
+        self._persist_core(project)
+        if not project.repository.is_dirty:
+            self._close_modules(project)
+            project.repository.flush()
+            self._finish_project_close(project)
+            return None
+        project.repository.begin_background_flush()
+        self._background_save_repository = project.repository
+        self._background_close_project = project
+        if ENABLED:
+            LOGGER.info("[Save] background flush prepared close=True")
+        return project.repository
+
+    def finish_background_save(self, succeeded: bool) -> bool:
+        """Termine l'exclusion de stockage et finalise éventuellement la fermeture.
+
+        Retourne ``True`` si la sauvegarde terminait une fermeture de projet.
+        En cas d'échec, le projet et son verrou restent actifs exactement comme
+        lors d'un échec de ``close_project`` synchrone.
+        """
+        repository = self._background_save_repository
+        if repository is None:
+            raise RuntimeError("Aucune sauvegarde asynchrone active.")
+        closing_project = self._background_close_project
+        self._background_save_repository = None
+        self._background_close_project = None
+        if not succeeded:
+            repository.end_background_flush()
+            if ENABLED:
+                LOGGER.info("[Save] background flush failed close=%s", closing_project is not None)
+            return closing_project is not None
+        if closing_project is not None:
+            # Le worker a sérialisé le snapshot complet. Les modules doivent
+            # donc rester ouverts jusqu'ici : leurs lookups sont encore appelés
+            # par les modèles Qt pendant le dialogue modal.
+            if ENABLED:
+                LOGGER.info("[Shutdown] modules teardown after background flush")
+            try:
+                self._close_modules(closing_project)
+            finally:
+                repository.end_background_flush()
+            self._finish_project_close(closing_project)
+            return True
+        repository.end_background_flush()
+        self.dirty_changed.emit(False)
+        if ENABLED:
+            LOGGER.info("[Save] background flush succeeded close=False")
+        return False
 
     def notify_persistent_change(self) -> None:
         """Point d'orchestration pour les services ayant modifié leur repository."""
@@ -228,6 +301,7 @@ class ProjectManager(QObject):
             raise
 
     def close_project(self, save: bool = True) -> None:
+        self._ensure_no_background_save()
         project = self._active_project
         if project is None:
             return
@@ -235,26 +309,11 @@ class ProjectManager(QObject):
             LOGGER.info("[Shutdown] project teardown save=%s dirty=%s", save, project.repository.is_dirty)
         project.repository.log_dirty_state("close_start")
         if save:
-            with measure("shutdown.modules_save"), operation("Shutdown", "modules_save"):
-                for module in self._modules.enabled(project.manifest.enabled_modules):
-                    context = ProjectModuleContext(
-                        project.manifest.project_id,
-                        project.repository,
-                        module.descriptor,
-                        project.manifest.capabilities,
-                    )
-                    module.save(context)
-                    project.repository.log_dirty_state(f"after_module_save:{module.descriptor.module_id}")
+            self._save_modules(project)
         with measure("shutdown.project_closing_signal"), operation("Shutdown", "project_closing_signal"):
             self.project_closing.emit(project)
         project.repository.log_dirty_state("after_project_closing_signal")
-        with measure("shutdown.modules_close"), operation("Shutdown", "modules_close"):
-            for module in reversed(self._modules.enabled(project.manifest.enabled_modules)):
-                context = ProjectModuleContext(
-                    project.manifest.project_id, project.repository, module.descriptor, project.manifest.capabilities
-                )
-                module.close(context)
-                project.repository.log_dirty_state(f"after_module_close:{module.descriptor.module_id}")
+        self._close_modules(project)
         if save:
             # Workspace is deliberately excluded from the dirty indicator, but
             # must still survive a normal close. The project lock is the session
@@ -262,18 +321,51 @@ class ProjectManager(QObject):
             # ``clean_shutdown`` in the monolithic manifest would otherwise
             # rewrite an unchanged multi-gigabyte project solely for a flag that
             # is not consumed by project recovery.
-            with measure("shutdown.persist_core"), operation("Shutdown", "persist_core"):
-                for workspace in project.workspaces.values():
-                    project.repository.save_workspace(workspace)
-                project.repository.save_state(project.state)
+            self._persist_core(project)
             project.repository.log_dirty_state("after_persist_core")
             with measure("shutdown.repository_flush"), operation("Shutdown", "repository_flush"):
                 project.repository.flush()
+        self._finish_project_close(project)
+
+    def _save_modules(self, project: Project) -> None:
+        with measure("shutdown.modules_save"), operation("Shutdown", "modules_save"):
+            for module in self._modules.enabled(project.manifest.enabled_modules):
+                context = ProjectModuleContext(
+                    project.manifest.project_id,
+                    project.repository,
+                    module.descriptor,
+                    project.manifest.capabilities,
+                )
+                module.save(context)
+                project.repository.log_dirty_state(f"after_module_save:{module.descriptor.module_id}")
+
+    def _close_modules(self, project: Project) -> None:
+        with measure("shutdown.modules_close"), operation("Shutdown", "modules_close"):
+            for module in reversed(self._modules.enabled(project.manifest.enabled_modules)):
+                context = ProjectModuleContext(
+                    project.manifest.project_id, project.repository, module.descriptor, project.manifest.capabilities
+                )
+                module.close(context)
+                project.repository.log_dirty_state(f"after_module_close:{module.descriptor.module_id}")
+
+    @staticmethod
+    def _persist_core(project: Project) -> None:
+        with measure("shutdown.persist_core"), operation("Shutdown", "persist_core"):
+            for workspace in project.workspaces.values():
+                project.repository.save_workspace(workspace)
+            project.repository.save_state(project.state)
+        project.repository.log_dirty_state("after_persist_core")
+
+    def _finish_project_close(self, project: Project) -> None:
         self._active_project = None
         with measure("shutdown.project_lock_release"), operation("Shutdown", "project_lock_release"):
             project.repository.close()
         self.dirty_changed.emit(False)
         self.project_closed.emit()
+
+    def _ensure_no_background_save(self) -> None:
+        if self._background_save_repository is not None:
+            raise RuntimeError("Une sauvegarde du projet est déjà en cours.")
 
     def _require_active(self) -> Project:
         if self._active_project is None:

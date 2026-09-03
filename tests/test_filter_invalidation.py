@@ -163,3 +163,42 @@ def test_category_profiling_reports_filter_and_qt_metrics(qapp, monkeypatch, cap
     assert "source_rows=3" in message
     assert "filter_calls=" in message
     assert "model_reset=" in message
+
+
+def test_category_profile_reports_final_source_rows_when_filter_precedes_loading(qapp, monkeypatch, caplog):
+    monkeypatch.setattr(performance, "ENABLED", True)
+    caplog.set_level("INFO", logger="carvex.performance")
+    model = FileTableModel()
+    proxy = FileFilterProxyModel()
+    proxy.setSourceModel(model)
+
+    proxy.set_category("Images")
+    model.set_records(_records(3))
+    qapp.processEvents()
+    qapp.processEvents()
+
+    message = "\n".join(record.message for record in caplog.records)
+    assert "source_rows=3" in message
+    assert "source_rows_at_start=0" in message
+
+
+def test_text_sort_uses_source_values_without_display_role_callbacks(qapp, monkeypatch):
+    monkeypatch.setattr(performance, "ENABLED", True)
+    records = (
+        {"file_id": "1", "name": "z.jpg", "category": "Images"},
+        {"file_id": "2", "name": "a.jpg", "category": "Archives"},
+        {"file_id": "3", "name": "m.jpg", "category": "Images"},
+    )
+    model = FileTableModel()
+    proxy = FileFilterProxyModel()
+    proxy.setSourceModel(model)
+    proxy.sort(FileTableModel.COLUMNS.index(("Nom", "name")), Qt.SortOrder.AscendingOrder)
+
+    proxy.set_category("Images")
+    model.set_records(records)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    accesses, _roles = model.performance_data_accesses()
+    assert accesses == 0
+    assert [proxy.index(row, 3).data() for row in range(proxy.rowCount())] == ["m.jpg", "z.jpg"]

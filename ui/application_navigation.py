@@ -127,6 +127,8 @@ class EvidenceWorkflowController:
         status_message: Callable[[str], None],
         persistent_change: Callable[[], None],
         refresh_file_markers: Callable[[Iterable[str]], None] | None = None,
+        refresh_timeline_markers: Callable[[Iterable[str]], None] | None = None,
+        refresh_bookmark_markers: Callable[[Iterable[str]], None] | None = None,
         parent=None,
     ) -> None:
         self._entity_resolver = entity_resolver
@@ -137,6 +139,8 @@ class EvidenceWorkflowController:
         self._status_message = status_message
         self._persistent_change = persistent_change
         self._refresh_file_markers = refresh_file_markers
+        self._refresh_timeline_markers = refresh_timeline_markers
+        self._refresh_bookmark_markers = refresh_bookmark_markers
         self._parent = parent
 
     def add_file(self, file_record: Mapping[str, Any] | None) -> None:
@@ -199,17 +203,21 @@ class EvidenceWorkflowController:
 
     def add_files_bulk(self, file_ids: Iterable[str]) -> None:
         """Commande UI unique : création groupée des preuves sélectionnées."""
-        identifiers = tuple(dict.fromkeys(file_id for file_id in file_ids if file_id))
+        with performance.measure("InvestigationBulk.prepare_ids"):
+            identifiers = tuple(dict.fromkeys(file_id for file_id in file_ids if file_id))
         if not identifiers:
             return
         service = self._investigation_panel.service
         if service is None:
             return
-        with performance.operation("Investigation", "add_files_bulk"):
-            result = service.create_items_batch(
-                tuple(InvestigationTargetRef("file", file_id) for file_id in identifiers)
-            )
-        self._after_bulk_change(identifiers, result.applied_count, "preuve(s) ajoutée(s) à Investigation.")
+        with performance.measure("InvestigationBulk.action", requested=len(identifiers)):
+            with performance.operation("Investigation", "add_files_bulk"):
+                with performance.measure("InvestigationBulk.service_create", requested=len(identifiers)):
+                    result = service.create_items_batch(
+                        tuple(InvestigationTargetRef("file", file_id) for file_id in identifiers)
+                    )
+            with performance.measure("InvestigationBulk.downstream", applied=result.applied_count):
+                self._after_bulk_change(identifiers, result.applied_count, "preuve(s) ajoutée(s) à Investigation.")
 
     def add_files_to_collection_bulk(self, file_ids: Iterable[str]) -> None:
         """Choisit une Collection, puis exécute une unique commande de masse."""
@@ -243,10 +251,16 @@ class EvidenceWorkflowController:
 
     def _after_bulk_change(self, file_ids: tuple[str, ...], applied_count: int, message: str) -> None:
         if self._refresh_file_markers is not None:
-            self._refresh_file_markers(file_ids)
-        self._timeline_view.set_investigation_presence_lookup(self.timeline_event_is_in_investigation)
-        self._bookmarks_view.set_investigation_presence_lookup(self.bookmark_is_in_investigation)
-        self._persistent_change()
+            with performance.measure("InvestigationBulk.files_markers", ids=len(file_ids)):
+                self._refresh_file_markers(file_ids)
+        if self._refresh_timeline_markers is not None:
+            with performance.measure("InvestigationBulk.timeline_markers", ids=len(file_ids)):
+                self._refresh_timeline_markers(file_ids)
+        if self._refresh_bookmark_markers is not None:
+            with performance.measure("InvestigationBulk.bookmark_markers", ids=len(file_ids)):
+                self._refresh_bookmark_markers(file_ids)
+        with performance.measure("InvestigationBulk.project_dirty"):
+            self._persistent_change()
         self._status_message(f"{applied_count} {message}")
 
     def _edit(
@@ -266,7 +280,10 @@ class EvidenceWorkflowController:
         if item is None:
             return
         self._tabs.setCurrentIndex(3)
-        self._timeline_view.set_investigation_presence_lookup(self.timeline_event_is_in_investigation)
-        self._bookmarks_view.set_investigation_presence_lookup(self.bookmark_is_in_investigation)
+        if target.target_kind == "file":
+            if self._refresh_timeline_markers is not None:
+                self._refresh_timeline_markers((target.target_id,))
+            if self._refresh_bookmark_markers is not None:
+                self._refresh_bookmark_markers((target.target_id,))
         self._persistent_change()
         self._status_message("Preuve enregistrée dans Investigation.")

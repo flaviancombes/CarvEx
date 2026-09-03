@@ -113,6 +113,54 @@ def test_repeated_incremental_batch_keeps_one_parent_and_one_event():
     assert model.event_for_id("stable-event") is event
 
 
+def test_investigation_marker_refresh_is_limited_to_changed_file_nodes():
+    moment = datetime(2025, 3, 20, tzinfo=UTC)
+    file_ids = [str(uuid4()) for _ in range(100)]
+    model = TimelineTableModel()
+    model.set_events(
+        tuple(
+            TimelineEvent(
+                FILE_MODIFIED,
+                moment + timedelta(seconds=index),
+                FILESYSTEM,
+                file_record={"file_id": file_id, "name": f"file-{index}.jpg"},
+            )
+            for index, file_id in enumerate(file_ids)
+        )
+    )
+    changes = []
+    resets = []
+    layouts = []
+    model.dataChanged.connect(lambda first, last, _roles: changes.append((first, last)))
+    model.modelReset.connect(lambda: resets.append(True))
+    model.layoutChanged.connect(lambda: layouts.append(True))
+
+    model.refresh_investigation_markers(file_ids[:5])
+
+    assert len(changes) == 10  # parent + enfant unique, pour chacun des cinq file_id.
+    assert not resets
+    assert not layouts
+
+
+def test_reinstalling_the_same_investigation_lookup_does_not_refresh_the_timeline():
+    moment = datetime(2025, 3, 20, tzinfo=UTC)
+    model = TimelineTableModel()
+    model.set_events(
+        (TimelineEvent(FILE_MODIFIED, moment, FILESYSTEM, file_record={"file_id": "file-1", "name": "one"}),)
+    )
+
+    def lookup(_event) -> bool:
+        return False
+
+    model.set_investigation_lookup(lookup)
+    changes = []
+    model.dataChanged.connect(lambda *_args: changes.append(True))
+
+    model.set_investigation_lookup(lookup)
+
+    assert not changes
+
+
 def test_complete_reconstruction_is_idempotent_for_duplicate_event_ids():
     moment = datetime(2025, 3, 20, tzinfo=UTC)
     record = {"file_id": str(uuid4()), "name": "f7178336.jpg"}

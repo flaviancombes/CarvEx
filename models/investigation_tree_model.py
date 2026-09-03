@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
@@ -30,10 +31,13 @@ class InvestigationTreeEntry:
     title: str
     subtitle: str = ""
     related_target_ref: InvestigationTargetRef | None = None
+    added_at: datetime | None = None
 
 
 class InvestigationTreeModel(QAbstractItemModel):
     """Arbre à deux niveaux, mis à jour section par section par le contrôleur."""
+
+    _COLUMNS = ("Investigation", "Ajouté le")
 
     _SECTION_LABELS = {
         InvestigationSection.ITEMS: "📄 Preuves",
@@ -65,7 +69,7 @@ class InvestigationTreeModel(QAbstractItemModel):
         self._loaded: set[InvestigationSection] = set()
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
-        return 1
+        return len(self._COLUMNS)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
         if not parent.isValid():
@@ -76,7 +80,7 @@ class InvestigationTreeModel(QAbstractItemModel):
         return 0
 
     def index(self, row: int, column: int, parent: QModelIndex = QModelIndex()) -> QModelIndex:  # noqa: N802, B008
-        if column != 0 or row < 0:
+        if column < 0 or column >= self.columnCount(parent) or row < 0:
             return QModelIndex()
         if not parent.isValid():
             return self.createIndex(row, column, self._sections[row]) if row < len(self._sections) else QModelIndex()
@@ -94,14 +98,32 @@ class InvestigationTreeModel(QAbstractItemModel):
         return self.createIndex(self._sections.index(section), 0, section) if section is not None else QModelIndex()
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
-        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+        if not index.isValid():
             return None
         node = index.internalPointer()
+        if role == Qt.ItemDataRole.ToolTipRole and isinstance(node, InvestigationTreeEntry) and index.column() == 1:
+            value = self._format_added_at(node.added_at)
+            return None if value == "—" else f"Ajouté à l'investigation le {value}"
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
         if isinstance(node, InvestigationSection):
-            return self._SECTION_LABELS[node]
+            return self._SECTION_LABELS[node] if index.column() == 0 else ""
         if isinstance(node, InvestigationTreeEntry):
-            return node.title if not node.subtitle else f"{node.title} — {node.subtitle}"
+            if index.column() == 0:
+                return node.title if not node.subtitle else f"{node.title} — {node.subtitle}"
+            return self._format_added_at(node.added_at) if node.subject_kind == "item" else ""
         return None
+
+    def headerData(
+        self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole
+    ):  # noqa: N802
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self._COLUMNS[section] if 0 <= section < len(self._COLUMNS) else None
+        return super().headerData(section, orientation, role)
+
+    @staticmethod
+    def _format_added_at(value: datetime | None) -> str:
+        return "—" if value is None else value.astimezone().strftime("%d/%m/%Y %H:%M:%S")
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:  # noqa: N802
         if not index.isValid():

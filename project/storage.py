@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -63,8 +63,16 @@ class ProjectStorageAdapter(ABC):
         """
         return self.is_dirty, (), ()
 
+    def begin_background_flush(self) -> None:
+        """Réserve le backend à un flush exclusif préparé sur le thread UI."""
+        return None
+
+    def end_background_flush(self) -> None:
+        """Termine la réservation créée par :meth:`begin_background_flush`."""
+        return None
+
     @abstractmethod
-    def flush(self) -> None: ...
+    def flush(self, progress: Callable[[str], None] | None = None) -> None: ...
 
     @abstractmethod
     def snapshot(self) -> dict[str, dict[str, Any]]: ...
@@ -108,7 +116,7 @@ class InMemoryProjectStorage(ProjectStorageAdapter):
     def is_dirty(self) -> bool:
         return self._dirty
 
-    def flush(self) -> None:
+    def flush(self, progress: Callable[[str], None] | None = None) -> None:
         self._dirty = False
         self._dirty_namespaces.clear()
 
@@ -156,6 +164,7 @@ class JsonProjectStorage(ProjectStorageAdapter):
         self._dirty = False
         self._dirty_namespaces: set[str] = set()
         self._dirty_operations: dict[str, str] = {}
+        self._background_flush_active = False
         self._namespaces: dict[str, dict[str, Any]] | None = {} if create else None
         self._codecs: ProjectCodecRegistry | None = None
 
@@ -177,6 +186,7 @@ class JsonProjectStorage(ProjectStorageAdapter):
         return self._ensure_decoded().get(namespace, {}).get(key, default)
 
     def write(self, namespace: str, key: str, value: Any) -> None:
+        self._ensure_writable()
         values = self._ensure_decoded().setdefault(namespace, {})
         # Une comparaison structurelle n'est nécessaire que lorsqu'elle peut
         # éviter une sérialisation complète. Une fois dirty, le flush est déjà
@@ -197,6 +207,7 @@ class JsonProjectStorage(ProjectStorageAdapter):
         self._mark_dirty(namespace, f"write:{key}")
 
     def delete(self, namespace: str, key: str) -> None:
+        self._ensure_writable()
         values = self._ensure_decoded().get(namespace, {})
         if key not in values:
             return
@@ -220,12 +231,21 @@ class JsonProjectStorage(ProjectStorageAdapter):
         """Whether opening restored the last known valid project document."""
         return self._recovered_from_backup
 
-    def flush(self) -> None:
+    def begin_background_flush(self) -> None:
+        if self._background_flush_active:
+            raise RuntimeError("Une sauvegarde asynchrone du projet est déjà active.")
+        self._background_flush_active = True
+
+    def end_background_flush(self) -> None:
+        self._background_flush_active = False
+
+    def flush(self, progress: Callable[[str], None] | None = None) -> None:
         if not self._dirty and self._file.is_file():
             if ENABLED:
                 LOGGER.info("[Storage] flush skipped reason=clean dirty=False dirty_namespaces=[]")
             self._ensure_entry_file()
             return
+        self._notify_progress(progress, "preparing")
         if ENABLED:
             dirty, namespaces, operations = self.dirty_details()
             LOGGER.info(
@@ -252,14 +272,17 @@ class JsonProjectStorage(ProjectStorageAdapter):
             pipeline_stage("JsonProjectStorage.modèles vers primitives"),
             operation("JsonProjectStorage", "encode_models"),
         ):
+            self._notify_progress(progress, "encoding_models")
             encoded = _encode(document, self._require_codecs())
         log_memory_snapshot("JsonProjectStorage.after_encode")
         with pipeline_stage("JsonProjectStorage.encodage JSON"), operation("JsonProjectStorage", "json_dumps"):
+            self._notify_progress(progress, "serializing_json")
             payload = json.dumps(encoded, ensure_ascii=False, indent=2).encode("utf-8")
         if ENABLED:
             LOGGER.info("[Sauvegarde] JSON produit bytes=%d", len(payload))
             log_memory_snapshot("JsonProjectStorage.after_json_dumps")
         with pipeline_stage("JsonProjectStorage.validation"):
+            self._notify_progress(progress, "validating")
             # json.dumps vient de produire ``payload`` à partir du document déjà
             # validé. Le reparser intégralement ne renforce pas sa validité.
             self._validate_document(document)
@@ -271,12 +294,16 @@ class JsonProjectStorage(ProjectStorageAdapter):
         try:
             if previous_primary is not None:
                 with pipeline_stage("JsonProjectStorage.backup"):
+                    self._notify_progress(progress, "backup")
                     self._create_backup()
             with pipeline_stage("JsonProjectStorage.écriture atomique projet"):
+                self._notify_progress(progress, "atomic_write")
                 self._atomic_write(self._file, payload)
             with pipeline_stage("JsonProjectStorage.checksum"):
+                self._notify_progress(progress, "checksum")
                 self._atomic_write(self._checksum_file, f"{self._checksum(payload)}\n".encode("ascii"))
             with pipeline_stage("JsonProjectStorage.fichier entrée"):
+                self._notify_progress(progress, "finalizing")
                 self._ensure_entry_file()
         except Exception:
             self._restore_file(self._file, previous_primary)
@@ -288,6 +315,15 @@ class JsonProjectStorage(ProjectStorageAdapter):
         self._dirty_namespaces.clear()
         self._dirty_operations.clear()
         log_memory_snapshot("JsonProjectStorage.after_flush")
+
+    @staticmethod
+    def _notify_progress(progress: Callable[[str], None] | None, phase: str) -> None:
+        if progress is not None:
+            progress(phase)
+
+    def _ensure_writable(self) -> None:
+        if self._background_flush_active:
+            raise RuntimeError("Le projet est en cours de sauvegarde ; les écritures sont temporairement suspendues.")
 
     def _mark_dirty(self, namespace: str, operation: str) -> None:
         was_dirty = self._dirty

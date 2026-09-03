@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -92,10 +93,23 @@ class ProjectRepository:
     def is_dirty(self) -> bool:
         return self._storage.is_dirty
 
-    def flush(self) -> None:
+    def begin_background_flush(self) -> None:
+        """Gèle les écritures avant une sérialisation exclusive hors UI."""
+        self._storage.begin_background_flush()
+
+    def end_background_flush(self) -> None:
+        """Rouvre les écritures après la fin — réussie ou non — du worker."""
+        self._storage.end_background_flush()
+
+    def flush(self, progress: Callable[[str], None] | None = None) -> None:
         self.log_dirty_state("before_flush")
         with pipeline_stage("ProjectStorage.flush"):
-            self._storage.flush()
+            if progress is None:
+                # Preserve third-party/test backends implementing the original
+                # zero-argument adapter contract.
+                self._storage.flush()
+            else:
+                self._storage.flush(progress)
 
     def log_dirty_state(self, stage: str) -> None:
         """Journalise les dirty flags sans parcourir les données du projet."""

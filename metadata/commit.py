@@ -54,3 +54,14 @@ class MetadataCommitService:
             if on_timing is not None:
                 on_timing("MetadataCommitService", (perf_counter() - started) * 1000)
         self._checkpoint_before_pending_flush = None
+
+    def materialize_pending(self) -> None:
+        """Expose un checkpoint cohérent à une sauvegarde déjà réservée.
+
+        Cette opération reste strictement mémoire : le thread appelant pourra
+        ensuite confier l'unique ``flush`` du projet au worker de sauvegarde.
+        """
+        if get_ident() != self._owner_thread:
+            raise RuntimeError("Seul le thread propriétaire du projet peut matérialiser les métadonnées.")
+        self._store.materialize_checkpoint(self._indexing.checkpoint())
+        self._checkpoint_before_pending_flush = None

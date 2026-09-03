@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from PySide6.QtCore import QModelIndex, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -56,6 +56,10 @@ class BookmarksView(QWidget):
     def set_investigation_presence_lookup(self, lookup: Callable[[object], bool] | None) -> None:
         self._investigation_presence_lookup = lookup
         self._model.set_investigation_lookup(lookup)
+
+    def refresh_investigation_markers(self, file_ids: Iterable[str]) -> None:
+        """Actualise les seuls bookmarks canoniques associés aux fichiers modifiés."""
+        self._model.refresh_investigation_markers(file_ids)
 
     def refresh_file_projection(self) -> None:
         self._model.refresh_file_projection()

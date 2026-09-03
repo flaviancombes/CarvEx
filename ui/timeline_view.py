@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from PySide6.QtCore import QModelIndex, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -493,6 +493,10 @@ class TimelineView(QWidget):
     def set_investigation_presence_lookup(self, lookup: Callable[[object], bool] | None) -> None:
         self._investigation_presence_lookup = lookup
         self._model.set_investigation_lookup(lookup)
+
+    def refresh_investigation_markers(self, file_ids: Iterable[str]) -> None:
+        """Actualise uniquement les parents Timeline affectés par un batch Investigation."""
+        self._model.refresh_investigation_markers(file_ids)
 
     def _show_context_menu(self, position) -> None:
         index = self.table.indexAt(position)

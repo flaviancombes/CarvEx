@@ -15,6 +15,7 @@ from metadata.correlation import MetadataCorrelationIndex
 from metadata.index import MetadataIndex
 from selection.canonical_entity_resolver import CanonicalEntityResolver
 from selection.file_selection import FileSelectionChange, FileSelectionModel
+from utils import performance
 from utils.performance import format_byte_size
 
 
@@ -76,6 +77,8 @@ class FileTableModel(QAbstractTableModel):
         self._correlation_counts: dict[str, int] = {}
         self._bookmark_rows: dict[str, list[int]] = {}
         self._filter_rows: list[_FilterRow] = []
+        self._performance_data_accesses = 0
+        self._performance_role_accesses: dict[int, int] = {}
         if bookmark_service is not None:
             bookmark_service.bookmarks_changed.connect(self._on_bookmarks_changed)
             bookmark_service.bookmarks_reset.connect(self._on_bookmarks_reset)
@@ -90,6 +93,10 @@ class FileTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.COLUMNS)
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if performance.ENABLED:
+            numeric_role = int(role)
+            self._performance_data_accesses += 1
+            self._performance_role_accesses[numeric_role] = self._performance_role_accesses.get(numeric_role, 0) + 1
         if not index.isValid():
             return None
         _, field = self.COLUMNS[index.column()]
@@ -125,6 +132,10 @@ class FileTableModel(QAbstractTableModel):
         if field == "size":
             return format_byte_size(value)
         return "" if value is None else str(value)
+
+    def performance_data_accesses(self) -> tuple[int, dict[int, int]]:
+        """Expose des compteurs agrégés, activés uniquement par CARVEX_PERF."""
+        return self._performance_data_accesses, dict(self._performance_role_accesses)
 
     def headerData(
         self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole
@@ -163,6 +174,16 @@ class FileTableModel(QAbstractTableModel):
     def numeric_size_at(self, row: int) -> int | None:
         filter_row = self.filter_row_at(row)
         return filter_row.numeric_size if filter_row is not None else None
+
+    def text_sort_value_at(self, row: int, field: str) -> str:
+        """Valeur textuelle brute déjà détenue par la ligne source.
+
+        Le proxy l'utilise pour les colonnes textuelles fréquentes : il évite
+        ainsi les appels Qt ``data(DisplayRole)`` répétés à chaque comparaison.
+        """
+        record = self.record_at(row)
+        value = "" if record is None else record.get(field, "")
+        return "" if value is None else str(value)
 
     def duplicate_count_at(self, row: int) -> int:
         file_id = self.file_id_at(row)

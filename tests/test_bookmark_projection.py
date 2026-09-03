@@ -25,3 +25,19 @@ def test_bookmark_projection_uses_file_fields_never_the_technical_identity():
     assert model.data(model.index(0, 2)) == "Documents"
     assert model.data(model.index(0, 3)) == "application/pdf"
     assert file_id not in {str(model.data(model.index(0, column))) for column in range(model.columnCount())}
+
+
+def test_investigation_marker_refresh_is_limited_to_changed_canonical_bookmarks():
+    file_ids = tuple(str(uuid4()) for _ in range(20))
+    service = BookmarkService(InMemoryBookmarkRepository())
+    service.add_many(BookmarkKey("file", file_id) for file_id in file_ids)
+    model = BookmarkModel(service)
+    changes = []
+    resets = []
+    model.dataChanged.connect(lambda first, last, _roles: changes.append((first.row(), last.row())))
+    model.modelReset.connect(lambda: resets.append(True))
+
+    model.refresh_investigation_markers(file_ids[:5])
+
+    assert changes == [(row, row) for row in range(5)]
+    assert not resets

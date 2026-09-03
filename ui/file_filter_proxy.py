@@ -8,7 +8,7 @@ from threading import current_thread
 from time import perf_counter
 from typing import Protocol
 
-from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, QTimer
+from PySide6.QtCore import QCollator, QModelIndex, QSortFilterProxyModel, Qt, QTimer
 
 from core.duplicates import DuplicateIndex
 from metadata.index import MetadataIndex
@@ -32,6 +32,12 @@ class _CategoryFilterProfile:
     model_resets: int = 0
     layout_changes: int = 0
     data_changes: int = 0
+    filter_sample_calls: int = 0
+    filter_sample_seconds: float = 0.0
+    sort_sample_calls: int = 0
+    sort_sample_seconds: float = 0.0
+    source_data_accesses_start: int = 0
+    source_role_accesses_start: dict[int, int] | None = None
 
 
 class ArtifactCacheLookup(Protocol):
@@ -44,6 +50,12 @@ class FileFilterProxyModel(QSortFilterProxyModel):
     """Filtre les enregistrements du modèle source sans créer de liste dérivée."""
 
     SEARCH_FIELDS = FileTableModel.SEARCH_FIELDS
+    _TEXT_SORT_FIELDS = {
+        3: "name",
+        4: "category",
+        5: "mime",
+        8: "sha256",
+    }
 
     def __init__(
         self,
@@ -66,6 +78,8 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         self._correlation_matches: frozenset[str] | None = None
         self._universal_matches: frozenset[str] = frozenset()
         self._category_profile: _CategoryFilterProfile | None = None
+        self._text_collator = QCollator()
+        self._text_collator.setCaseSensitivity(Qt.CaseSensitivity.CaseSensitive)
         self.setDynamicSortFilter(True)
         self.setSortLocaleAware(True)
         self.modelReset.connect(self._record_model_reset)
@@ -105,6 +119,10 @@ class FileFilterProxyModel(QSortFilterProxyModel):
             if performance.ENABLED
             else None
         )
+        if self._category_profile is not None and isinstance(model, FileTableModel):
+            accesses, roles = model.performance_data_accesses()
+            self._category_profile.source_data_accesses_start = accesses
+            self._category_profile.source_role_accesses_start = roles
         self.beginFilterChange()
         self._category = category
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
@@ -183,6 +201,22 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         profile = self._category_profile
         if profile is not None:
             profile.filter_calls += 1
+            sample_started = perf_counter() if profile.filter_calls % 1024 == 1 else None
+        else:
+            sample_started = None
+        try:
+            return self._filter_accepts_row(source_row, source_parent, profile)
+        finally:
+            if sample_started is not None and profile is not None:
+                profile.filter_sample_calls += 1
+                profile.filter_sample_seconds += perf_counter() - sample_started
+
+    def _filter_accepts_row(
+        self,
+        source_row: int,
+        source_parent: QModelIndex,
+        profile: _CategoryFilterProfile | None,
+    ) -> bool:
         model = self.sourceModel()
         if not isinstance(model, FileTableModel):
             if profile is not None:
@@ -240,8 +274,20 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         return accepted
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
-        if self._category_profile is not None:
-            self._category_profile.sort_calls += 1
+        profile = self._category_profile
+        if profile is not None:
+            profile.sort_calls += 1
+            sample_started = perf_counter() if profile.sort_calls % 1024 == 1 else None
+        else:
+            sample_started = None
+        try:
+            return self._less_than(left, right)
+        finally:
+            if sample_started is not None and profile is not None:
+                profile.sort_sample_calls += 1
+                profile.sort_sample_seconds += perf_counter() - sample_started
+
+    def _less_than(self, left: QModelIndex, right: QModelIndex) -> bool:
         if self._metadata_sort_identifier:
             model = self.sourceModel()
             if isinstance(model, FileTableModel) and self._metadata_index is not None:
@@ -251,6 +297,17 @@ class FileFilterProxyModel(QSortFilterProxyModel):
                     return self._metadata_index.sort_key(
                         left_id, self._metadata_sort_identifier
                     ) < self._metadata_index.sort_key(right_id, self._metadata_sort_identifier)
+        text_field = self._TEXT_SORT_FIELDS.get(left.column())
+        if text_field is not None:
+            model = self.sourceModel()
+            if isinstance(model, FileTableModel):
+                return (
+                    self._text_collator.compare(
+                        model.text_sort_value_at(left.row(), text_field),
+                        model.text_sort_value_at(right.row(), text_field),
+                    )
+                    < 0
+                )
         if left.column() == FileTableModel.SIZE_COLUMN:
             model = self.sourceModel()
             if isinstance(model, FileTableModel):
@@ -302,15 +359,32 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         if profile is None:
             return
         self._category_profile = None
+        model = self.sourceModel()
+        if isinstance(model, FileTableModel):
+            source_rows = model.rowCount()
+            current_accesses, current_roles = model.performance_data_accesses()
+            data_accesses = current_accesses - profile.source_data_accesses_start
+            role_accesses = {
+                role: count - (profile.source_role_accesses_start or {}).get(role, 0)
+                for role, count in current_roles.items()
+                if count > (profile.source_role_accesses_start or {}).get(role, 0)
+            }
+        else:
+            source_rows = 0
+            data_accesses = 0
+            role_accesses = {}
         performance.LOGGER.info(
-            "[Catégorie] %r -> %r duration_ms=%.2f thread=%s source_rows=%d "
+            "[Catégorie] %r -> %r duration_ms=%.2f thread=%s source_rows=%d source_rows_at_start=%d "
             "filter_calls=%d accepted=%d category_rejections=%d other_rejections=%d "
             "sort_calls=%d model_reset=%d layout_changed=%d data_changed=%d "
-            "metadata_filter_active=%s correlation_filter_active=%s search_active=%s artifact_filter_active=%s",
+            "filter_sample_ms=%.2f filter_estimated_ms=%.2f sort_sample_ms=%.2f sort_estimated_ms=%.2f "
+            "source_data_accesses=%d source_roles=%s metadata_filter_active=%s "
+            "correlation_filter_active=%s search_active=%s artifact_filter_active=%s",
             profile.previous_category,
             profile.category,
             (perf_counter() - profile.started_at) * 1000,
             profile.thread_name,
+            source_rows,
             profile.source_rows,
             profile.filter_calls,
             profile.accepted_rows,
@@ -320,6 +394,12 @@ class FileFilterProxyModel(QSortFilterProxyModel):
             profile.model_resets,
             profile.layout_changes,
             profile.data_changes,
+            profile.filter_sample_seconds * 1000,
+            profile.filter_sample_seconds * 1000 * 1024,
+            profile.sort_sample_seconds * 1000,
+            profile.sort_sample_seconds * 1000 * 1024,
+            data_accesses,
+            role_accesses,
             self._metadata_matches is not None,
             self._correlation_matches is not None,
             bool(self._search_text),

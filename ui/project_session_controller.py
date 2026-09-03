@@ -94,6 +94,7 @@ class ProjectSessionController:
         self._correlation_engine: MetadataCorrelationEngine | None = None
         self._correlation_store: MetadataCorrelationStore | None = None
         self._metadata_correlations_dirty = False
+        self._persistence_paused = False
         self._metadata_timer = QTimer(project_manager)
         self._metadata_timer.setInterval(25)
         self._metadata_timer.timeout.connect(self._drain_metadata_indexing)
@@ -234,6 +235,8 @@ class ProjectSessionController:
             self._metadata_manager.set_store_writable(True)
 
     def _drain_metadata_indexing(self) -> None:
+        if self._persistence_paused:
+            return
         indexing = self._metadata_indexing
         commit = self._metadata_commit
         if indexing is None or commit is None:
@@ -308,7 +311,10 @@ class ProjectSessionController:
                         commit.commit(result)
                 self._metadata_correlations_dirty = True
             if self._metadata_correlations_dirty:
-                self._finalize_metadata_indexing(for_shutdown=bool(_args))
+                self._finalize_metadata_indexing(
+                    for_shutdown=bool(_args),
+                    flush=not self._persistence_paused,
+                )
         self._metadata_manager.set_store_writable(True)
         self._metadata_indexing = None
         self._metadata_commit = None
@@ -323,6 +329,7 @@ class ProjectSessionController:
         report: IndexingCompletionReport | None = None,
         *,
         for_shutdown: bool = False,
+        flush: bool = True,
     ) -> None:
         """Build derived correlations once, then persist the coherent checkpoint."""
         commit = self._metadata_commit
@@ -346,15 +353,31 @@ class ProjectSessionController:
                     with report.stage("Rafraîchissement DetailsPanel (corrélations)"):
                         self._details_panel.set_correlation_index(store.index, self._file_table.file_label_for)
             self._metadata_correlations_dirty = False
-        with (
-            performance.operation("MetadataIndexing", "flush_pending"),
-            pipeline_stage("MetadataCommitService.flush_pending"),
-        ):
-            commit.flush_pending(report.record_elapsed)
+        if flush:
+            with (
+                performance.operation("MetadataIndexing", "flush_pending"),
+                pipeline_stage("MetadataCommitService.flush_pending"),
+            ):
+                commit.flush_pending(report.record_elapsed)
+        else:
+            with pipeline_stage("MetadataCommitService.materialize_pending"):
+                commit.materialize_pending()
         mark_pipeline_finished()
         finish_pipeline_profile()
         if performance.ENABLED:
             QTimer.singleShot(0, report.finish)
+
+    def pause_persistent_work(self) -> None:
+        """Suspend les écritures différées pendant un flush exclusif du projet."""
+        self._persistence_paused = True
+        self._metadata_timer.stop()
+
+    def resume_persistent_work(self) -> None:
+        """Réactive le drain Qt après la fin du flush exclusif."""
+        self._persistence_paused = False
+        indexing = self._metadata_indexing
+        if indexing is not None and indexing.is_running:
+            self._metadata_timer.start()
 
     def _show_metadata_progress(self) -> None:
         if self._metadata_indexing is None:

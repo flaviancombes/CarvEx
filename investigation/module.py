@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import fields
+
 from investigation.events import EventBus, EventType
 from investigation.integrity import InvestigationIntegrityValidator
 from investigation.journal import InvestigationJournalEntry, JournalSubscriber
@@ -10,9 +13,29 @@ from investigation.physical_representation import InvestigationPhysicalRepresent
 from investigation.queries import InvestigationQueryService
 from investigation.repository import InvestigationRepository
 from investigation.service import InvestigationService
-from project.codecs import ProjectCodecRegistry, dataclass_codec, enum_codec
+from project.codecs import ProjectCodec, ProjectCodecRegistry, dataclass_codec, enum_codec
 from project.migrations import ModuleMigrationService
 from project.modules import ModuleDescriptor, ProjectModule, ProjectModuleContext
+
+
+def _investigation_item_codec() -> ProjectCodec:
+    """Préserve l'absence historique de ``created_at`` sans date inventée."""
+
+    from investigation.item import InvestigationItem
+
+    def decode(payload: object) -> InvestigationItem:
+        if not isinstance(payload, Mapping):
+            raise ValueError("La charge d'un InvestigationItem doit être un mapping.")
+        values = dict(payload)
+        values.setdefault("created_at", None)
+        return InvestigationItem(**values)
+
+    return ProjectCodec(
+        type_id="dataclass:investigation.item.InvestigationItem",
+        value_type=InvestigationItem,
+        encode=lambda item: {field.name: getattr(item, field.name) for field in fields(item)},
+        decode=decode,
+    )
 
 
 class InvestigationProjectModule(ProjectModule):
@@ -60,7 +83,7 @@ class InvestigationProjectModule(ProjectModule):
             HypothesisStatus,
             InvestigationHypothesis,
         )
-        from investigation.item import InvestigationItem, InvestigationPriority, InvestigationStatus
+        from investigation.item import InvestigationPriority, InvestigationStatus
         from investigation.note import InvestigationNote, InvestigationNoteFormat
         from investigation.relation import InvestigationRelation, InvestigationRelationType
         from investigation.tag import InvestigationTag, TagAssignment
@@ -68,7 +91,7 @@ class InvestigationProjectModule(ProjectModule):
 
         registry.register_many(
             [
-                dataclass_codec("dataclass:investigation.item.InvestigationItem", InvestigationItem),
+                _investigation_item_codec(),
                 enum_codec("enum:investigation.item.InvestigationPriority", InvestigationPriority),
                 enum_codec("enum:investigation.item.InvestigationStatus", InvestigationStatus),
                 dataclass_codec("dataclass:investigation.collection.InvestigationCollection", InvestigationCollection),

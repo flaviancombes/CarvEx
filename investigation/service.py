@@ -37,6 +37,7 @@ from investigation.note import InvestigationNote, InvestigationNoteFormat, Inves
 from investigation.relation import InvestigationRelation, InvestigationRelationId, InvestigationRelationType
 from investigation.tag import InvestigationTag, InvestigationTagId, TagAssignment, TagAssignmentId, normalize_tag_name
 from investigation.target_ref import InvestigationTargetRef
+from utils import performance
 
 
 class InvestigationService:
@@ -142,32 +143,35 @@ class InvestigationService:
         unique événement de fin est publié uniquement après la cohérence de
         l'index et du repository.
         """
-        unique = tuple(dict.fromkeys(subjects))
-        skipped: list[InvestigationItem] = []
-        candidates: list[InvestigationItem] = []
-        for subject in unique:
-            existing = self._manager.find_item_by_subject(subject.target_kind, subject.target_id)
-            if existing is not None:
-                skipped.append(existing)
-                continue
-            candidates.append(
-                InvestigationItem(
-                    item_id=InvestigationItemId(str(uuid4())),
-                    subject_kind=subject.target_kind,
-                    subject_id=subject.target_id,
-                    created_by=created_by,
-                    updated_by=created_by,
+        with performance.measure("InvestigationService.create_items_batch.prepare", requested=len(subjects)):
+            unique = tuple(dict.fromkeys(subjects))
+            skipped: list[InvestigationItem] = []
+            candidates: list[InvestigationItem] = []
+            for subject in unique:
+                existing = self._manager.find_item_by_subject(subject.target_kind, subject.target_id)
+                if existing is not None:
+                    skipped.append(existing)
+                    continue
+                candidates.append(
+                    InvestigationItem(
+                        item_id=InvestigationItemId(str(uuid4())),
+                        subject_kind=subject.target_kind,
+                        subject_id=subject.target_id,
+                        created_by=created_by,
+                        updated_by=created_by,
+                    )
                 )
-            )
-        created = self._manager.create_items_batch(tuple(candidates))
+        with performance.measure("InvestigationService.create_items_batch.mutation", candidates=len(candidates)):
+            created = self._manager.create_items_batch(tuple(candidates))
         result = BatchOperationResult(len(subjects), created, tuple(skipped))
-        self._publish(
-            EventType.BATCH_COMPLETED,
-            result.operation_id,
-            parent_kind="items",
-            parent_id="items",
-            created_by=created_by,
-        )
+        with performance.measure("InvestigationService.create_items_batch.publish", created=len(created)):
+            self._publish(
+                EventType.BATCH_COMPLETED,
+                result.operation_id,
+                parent_kind="items",
+                parent_id="items",
+                created_by=created_by,
+            )
         return result
 
     def update_item(self, item: InvestigationItem) -> InvestigationItem:

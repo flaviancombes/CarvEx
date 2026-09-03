@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
 from bookmarks.model import Bookmark, BookmarkKey
@@ -79,6 +81,8 @@ class BookmarkModel(QAbstractTableModel):
             )
 
     def set_investigation_lookup(self, lookup) -> None:
+        if lookup == self._investigation_lookup:
+            return
         self._investigation_lookup = lookup
         if self._bookmarks:
             self.dataChanged.emit(
@@ -86,6 +90,15 @@ class BookmarkModel(QAbstractTableModel):
                 self.index(len(self._bookmarks) - 1, self.INVESTIGATION_COLUMN),
                 [Qt.ItemDataRole.DisplayRole],
             )
+
+    def refresh_investigation_markers(self, file_ids: Iterable[str]) -> None:
+        """Notifie uniquement les bookmarks ``file/file_id`` touchés par un batch."""
+        for file_id in dict.fromkeys(file_id for file_id in file_ids if file_id):
+            row = self._rows.get(BookmarkKey("file", file_id))
+            if row is None:
+                continue
+            index = self.index(row, self.INVESTIGATION_COLUMN)
+            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole])
 
     def _on_batch_changed(self, result) -> None:
         for key in result.removed_keys:

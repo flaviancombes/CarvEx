@@ -8,7 +8,7 @@ indentation textuelle ne simule la hiérarchie.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, QSortFilterProxyModel, Qt
@@ -219,8 +219,17 @@ class TimelineTreeModel(QAbstractItemModel):
         return self._entity_resolver.bookmark_key_for(event)
 
     def set_investigation_lookup(self, lookup) -> None:
+        if lookup == self._investigation_lookup:
+            return
         self._investigation_lookup = lookup
         self._emit_column_changed(self.INVESTIGATION_COLUMN)
+
+    def refresh_investigation_markers(self, file_ids: Iterable[str]) -> None:
+        """Notifie les seuls nœuds dont l'indicateur Investigation a changé."""
+        for file_id in dict.fromkeys(file_id for file_id in file_ids if file_id):
+            node = self._nodes_by_key.get(file_id)
+            if node is not None:
+                self._emit_node_column_changed(node, self.INVESTIGATION_COLUMN)
 
     def _append_to_indexes(self, event: TimelineEvent, node: _FileNode | None = None) -> None:
         node = node or self._nodes_by_key.get(self._file_key(event))

@@ -57,6 +57,7 @@ from ui.ui_responsiveness_instrumentation import (
     stop_global_ui_event_loop_monitor,
 )
 from ui.workspace_controller import WorkspaceController
+from utils import performance
 
 
 class MainWindow(QMainWindow):
@@ -219,6 +220,8 @@ class MainWindow(QMainWindow):
             self._show_temporary_status,
             self._project_data_changed,
             refresh_file_markers=self.file_table.refresh_investigation_markers,
+            refresh_timeline_markers=self.timeline_view.refresh_investigation_markers,
+            refresh_bookmark_markers=self.bookmarks_view.refresh_investigation_markers,
             parent=self,
         )
         self._session = ProjectSessionController(
@@ -260,6 +263,9 @@ class MainWindow(QMainWindow):
             report_loader=ReportLoader,
             report_generator=generate_photorec_report,
             progress_factory=QProgressDialog,
+            background_tasks=self.background_tasks,
+            pause_persistent_work=self._session.pause_persistent_work,
+            resume_persistent_work=self._session.resume_persistent_work,
         )
         self._connect_signals()
 
@@ -374,6 +380,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._prepare_project_change():
+            if performance.ENABLED:
+                performance.LOGGER.info("[Shutdown] main window close accepted")
             stop_global_ui_event_loop_monitor()
             super().closeEvent(event)
         else:

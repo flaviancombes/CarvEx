@@ -51,7 +51,10 @@ class InvestigationItem:
     summary: str | None = None
     priority: InvestigationPriority = InvestigationPriority.INFORMATION
     status: InvestigationStatus = InvestigationStatus.NEW
-    created_at: datetime = field(default_factory=_now)
+    # Les projets antérieurs à l'introduction de cette donnée peuvent ne pas
+    # posséder la clé persistée. ``None`` conserve alors honnêtement cette
+    # absence, sans fabriquer une date lors de leur ouverture.
+    created_at: datetime | None = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     created_by: str | None = None
     updated_by: str | None = None
@@ -65,11 +68,15 @@ class InvestigationItem:
             raise ValueError("Un InvestigationItem doit référencer un sujet valide.")
         if not isinstance(self.priority, InvestigationPriority) or not isinstance(self.status, InvestigationStatus):
             raise ValueError("La priorité et le statut InvestigationItem doivent être typés.")
-        if not isinstance(self.created_at, datetime) or not isinstance(self.updated_at, datetime):
+        if self.created_at is not None and not isinstance(self.created_at, datetime):
+            raise ValueError("La date de création InvestigationItem doit être valide.")
+        if not isinstance(self.updated_at, datetime):
             raise ValueError("Les dates InvestigationItem doivent être valides.")
-        if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
+        if self.created_at is not None and self.created_at.tzinfo is None:
             raise ValueError("Les dates InvestigationItem doivent inclure un fuseau horaire.")
-        if self.updated_at < self.created_at:
+        if self.updated_at.tzinfo is None:
+            raise ValueError("Les dates InvestigationItem doivent inclure un fuseau horaire.")
+        if self.created_at is not None and self.updated_at < self.created_at:
             raise ValueError("La date de mise à jour ne peut pas précéder la création.")
 
     @property

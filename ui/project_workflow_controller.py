@@ -11,8 +11,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QThread, Slot
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Slot
+from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox, QProgressDialog
 
 from carvex import generate_photorec_report
 from core.file_identity import LegacyFileIdentityError
@@ -24,6 +24,8 @@ from project.models import ProjectMetadata, ReportSourceSnapshot
 from project.storage import JsonProjectStorage
 from ui.photo_rec_import_worker import PhotoRecImportWorker
 from ui.project_dialogs import NewProjectDialog
+from ui.project_save_dialog import ProjectSaveDialog
+from ui.project_save_worker import ProjectSaveWorker
 from ui.ui_responsiveness_instrumentation import mark_pipeline_finished, start_ui_responsiveness_probe
 from utils import performance
 from utils.performance import finish_pipeline_profile, measure, operation, pipeline_stage, start_pipeline_profile
@@ -48,6 +50,10 @@ class ProjectWorkflowController(QObject):
         report_loader=ReportLoader,
         report_generator=generate_photorec_report,
         progress_factory=QProgressDialog,
+        save_dialog_factory=ProjectSaveDialog,
+        background_tasks=None,
+        pause_persistent_work: Callable[[], None] | None = None,
+        resume_persistent_work: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._parent = parent
@@ -63,9 +69,18 @@ class ProjectWorkflowController(QObject):
         self._report_loader = report_loader
         self._report_generator = report_generator
         self._progress_factory = progress_factory
+        self._save_dialog_factory = save_dialog_factory
+        self._background_tasks = background_tasks
+        self._pause_persistent_work = pause_persistent_work or (lambda: None)
+        self._resume_persistent_work = resume_persistent_work or (lambda: None)
         self._import_thread: QThread | None = None
         self._import_worker: PhotoRecImportWorker | None = None
         self._import_progress: QProgressDialog | None = None
+        self._save_thread: QThread | None = None
+        self._save_worker: ProjectSaveWorker | None = None
+        self._save_progress: ProjectSaveDialog | None = None
+        self._save_continuation: Callable[[], None] | None = None
+        self._deferred_window_close = False
 
     def new_project(self, photo_rec_directory: str | None = None) -> None:
         dialog = self._dialog_factory(photo_rec_directory, self._parent)
@@ -78,21 +93,24 @@ class ProjectWorkflowController(QObject):
         if JsonProjectStorage.exists(root):
             QMessageBox.warning(self._parent, "Projet existant", "Un projet existe déjà à cet emplacement.")
             return
-        if not self.prepare_project_change():
-            return
-        try:
-            project = self._project_manager.create_project(
-                ProjectMetadata(
-                    dialog.name_field.text().strip(), description=dialog.description_field.toPlainText().strip() or None
-                ),
-                JsonProjectStorage(root, create=True),
-            )
-        except ProjectLockedError as error:
-            QMessageBox.warning(self._parent, "Projet verrouillé", str(error))
-            return
-        self._attach_project(project, str(root))
-        if dialog.import_field.text().strip():
-            self.import_photo_rec_directory(dialog.import_field.text().strip(), root)
+        name = dialog.name_field.text().strip()
+        description = dialog.description_field.toPlainText().strip() or None
+        import_directory = dialog.import_field.text().strip()
+
+        def create() -> None:
+            try:
+                project = self._project_manager.create_project(
+                    ProjectMetadata(name, description=description), JsonProjectStorage(root, create=True)
+                )
+            except ProjectLockedError as error:
+                QMessageBox.warning(self._parent, "Projet verrouillé", str(error))
+                return
+            self._attach_project(project, str(root))
+            if import_directory:
+                self.import_photo_rec_directory(import_directory, root)
+
+        if self.prepare_project_change(create):
+            create()
 
     def open_project(self) -> None:
         project_file, _selected_filter = QFileDialog.getOpenFileName(
@@ -108,15 +126,18 @@ class ProjectWorkflowController(QObject):
             self.remove_recent(root)
             QMessageBox.warning(self._parent, "Projet introuvable", "Ce projet n'existe plus.")
             return
-        if self._project_manager.active_project is not None and not self.prepare_project_change():
-            return
-        try:
-            project = self._project_manager.open_project(root)
-        except (OSError, ValueError, ProjectLockedError) as error:
-            QMessageBox.warning(self._parent, "Ouverture impossible", str(error))
-            return
-        self._attach_project(project, root)
-        self.load_saved_report_source(project)
+
+        def open_selected() -> None:
+            try:
+                project = self._project_manager.open_project(root)
+            except (OSError, ValueError, ProjectLockedError) as error:
+                QMessageBox.warning(self._parent, "Ouverture impossible", str(error))
+                return
+            self._attach_project(project, root)
+            self.load_saved_report_source(project)
+
+        if self._project_manager.active_project is None or self.prepare_project_change(open_selected):
+            open_selected()
 
     def import_photo_rec(self) -> None:
         directory = QFileDialog.getExistingDirectory(self._parent, "Importer un dossier PhotoRec")
@@ -237,13 +258,14 @@ class ProjectWorkflowController(QObject):
     def save_project(self) -> None:
         if self._project_manager.active_project is None:
             return
-        with operation("ProjectWorkflow", "save_project"):
-            self._capture_workspace()
-            self._project_manager.save_project()
-            self._refresh_ui()
+        self._capture_workspace()
+        self._start_project_save(close_after=False)
 
     def save_project_as(self) -> None:
         if self._project_manager.active_project is None:
+            return
+        if self._save_thread is not None:
+            self._show_status("Une sauvegarde du projet est déjà en cours.")
             return
         directory = QFileDialog.getExistingDirectory(self._parent, "Enregistrer le projet sous")
         if not directory:
@@ -258,14 +280,17 @@ class ProjectWorkflowController(QObject):
         self._attach_project(project, str(root))
 
     def close_project(self) -> None:
-        if self.prepare_project_change():
+        if self.prepare_project_change(self._clear_project_ui):
             self._clear_project_ui()
 
-    def prepare_project_change(self) -> bool:
+    def prepare_project_change(self, continuation: Callable[[], None] | None = None) -> bool:
         with measure("shutdown.total"), operation("Shutdown", "total"):
-            return self._prepare_project_change()
+            return self._prepare_project_change(continuation)
 
-    def _prepare_project_change(self) -> bool:
+    def _prepare_project_change(self, continuation: Callable[[], None] | None = None) -> bool:
+        if self._save_thread is not None and self._project_manager.active_project is not None:
+            self._show_status("La sauvegarde en cours doit se terminer avant de changer de projet.")
+            return False
         project = self._project_manager.active_project
         if project is None:
             if performance.ENABLED:
@@ -293,22 +318,128 @@ class ProjectWorkflowController(QObject):
             if answer == QMessageBox.StandardButton.Cancel:
                 return False
             if answer == QMessageBox.StandardButton.Save:
-                # ``close_project(save=True)`` prépare et persiste déjà toutes
-                # les données. Appeler ``save_project`` juste avant sérialisait
-                # le projet complet une deuxième fois sans rendre les données
-                # plus sûres.
-                with (
-                    measure("shutdown.project_close_after_save_choice"),
-                    operation("Shutdown", "project_close_after_save_choice"),
-                ):
-                    self._project_manager.close_project(save=True)
+                return self._start_project_save(close_after=True, continuation=continuation)
             else:
                 with measure("shutdown.project_close_discard"), operation("Shutdown", "project_close_discard"):
                     self._project_manager.close_project(save=False)
         else:
-            with measure("shutdown.project_close_clean"), operation("Shutdown", "project_close_clean"):
-                self._project_manager.close_project(save=True)
+            return self._start_project_save(close_after=True, continuation=continuation)
         return True
+
+    def _start_project_save(self, *, close_after: bool, continuation: Callable[[], None] | None = None) -> bool:
+        """Prépare le projet sur Qt puis transfère uniquement le flush au worker.
+
+        ``True`` signifie qu'aucun flush asynchrone n'a été lancé et que
+        l'appelant peut poursuivre immédiatement ; sinon il doit attendre la
+        continuation exécutée à la fin du worker.
+        """
+        if self._save_thread is not None:
+            self._show_status("Une sauvegarde du projet est déjà en cours.")
+            return False
+        self._pause_persistent_work()
+        try:
+            repository = (
+                self._project_manager.begin_background_close()
+                if close_after
+                else self._project_manager.begin_background_save()
+            )
+        except Exception:
+            self._resume_persistent_work()
+            raise
+        if repository is None:
+            self._resume_persistent_work()
+            if not close_after:
+                self._refresh_ui()
+            return True
+        dialog = self._save_dialog_factory(self._parent)
+        dialog.show()
+        thread = QThread(self)
+        worker = ProjectSaveWorker(repository)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.phase.connect(self._update_save_phase, Qt.ConnectionType.QueuedConnection)
+        worker.succeeded.connect(self._on_save_succeeded, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_save_failed, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._clear_save_worker)
+        thread.finished.connect(thread.deleteLater)
+        self._save_thread = thread
+        self._save_worker = worker
+        self._save_progress = dialog
+        self._save_continuation = continuation
+        self._deferred_window_close = close_after and continuation is None
+        if self._deferred_window_close and performance.ENABLED:
+            performance.LOGGER.info("[Shutdown] close deferred for background save")
+        if self._background_tasks is not None:
+            self._background_tasks.start_task("project_save", "Sauvegarde du projet")
+        thread.start()
+        return False
+
+    @Slot(str)
+    def _update_save_phase(self, phase: str) -> None:
+        label = self._save_phase_label(phase)
+        if self._save_progress is not None:
+            self._save_progress.set_phase(label)
+        if self._background_tasks is not None:
+            self._background_tasks.set_phase("project_save", label)
+
+    @Slot()
+    def _on_save_succeeded(self) -> None:
+        closing = self._project_manager.finish_background_save(True)
+        self._close_save_dialog()
+        if self._background_tasks is not None:
+            self._background_tasks.finish_task("project_save")
+        self._resume_persistent_work()
+        continuation = self._save_continuation
+        self._save_continuation = None
+        if closing:
+            if continuation is not None:
+                continuation()
+            elif self._deferred_window_close:
+                self._deferred_window_close = False
+                if performance.ENABLED:
+                    performance.LOGGER.info("[Shutdown] resuming deferred close")
+                # The first QCloseEvent was ignored to await the worker. Queue
+                # a fresh event after the successful lifecycle finalization.
+                QTimer.singleShot(0, self._parent.close)
+        else:
+            self._refresh_ui()
+            self._show_status("Projet sauvegardé.")
+
+    @Slot(str)
+    def _on_save_failed(self, message: str) -> None:
+        self._project_manager.finish_background_save(False)
+        self._close_save_dialog()
+        if self._background_tasks is not None:
+            self._background_tasks.finish_task("project_save", cancelled=True)
+        self._resume_persistent_work()
+        self._save_continuation = None
+        self._deferred_window_close = False
+        QMessageBox.critical(self._parent, "Sauvegarde impossible", f"Le projet n'a pas été sauvegardé :\n{message}")
+
+    @Slot()
+    def _clear_save_worker(self) -> None:
+        self._save_thread = None
+        self._save_worker = None
+
+    def _close_save_dialog(self) -> None:
+        if self._save_progress is not None:
+            self._save_progress.done(QDialog.DialogCode.Accepted)
+            self._save_progress = None
+
+    @staticmethod
+    def _save_phase_label(phase: str) -> str:
+        return {
+            "preparing": "Préparation des données…",
+            "encoding_models": "Encodage des données…",
+            "serializing_json": "Sérialisation du projet…",
+            "validating": "Validation de la sauvegarde…",
+            "backup": "Création de la sauvegarde…",
+            "atomic_write": "Écriture atomique du projet…",
+            "checksum": "Vérification de l’intégrité…",
+            "finalizing": "Finalisation…",
+        }.get(phase, "Sauvegarde du projet…")
 
     def load_saved_report_source(self, project) -> None:
         source = project.metadata.source_reference

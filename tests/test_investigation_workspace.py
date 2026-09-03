@@ -22,7 +22,7 @@ def test_workspace_header_helper_supports_tables_and_investigation_tree():
     assert isinstance(window.file_table.view, QTableView)
     assert isinstance(window.investigation_panel.tree, QTreeView)
     assert window._view_header(window.investigation_panel.tree) is window.investigation_panel.tree.header()
-    assert window._column_order(window.investigation_panel.tree) == (0,)
+    assert window._column_order(window.investigation_panel.tree) == (0, 1)
     assert window._sort_state(window.investigation_panel.tree)[1] in {"ascending", "descending"}
 
 
@@ -41,7 +41,7 @@ def test_workspace_capture_and_restore_preserve_investigation_tree_header_state(
     workspace = project.workspaces[project.state.active_workspace_id]
 
     assert workspace.active_tab == "investigation_view"
-    assert workspace.columns_by_view["investigation_view"] == (0,)
+    assert workspace.columns_by_view["investigation_view"] == (0, 1)
     assert "investigation_view" in workspace.header_states
     assert "investigation_view" in workspace.sort_by_view
 

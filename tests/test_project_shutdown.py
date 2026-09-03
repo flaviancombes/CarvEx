@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, QThread
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from investigation.module import InvestigationProjectModule
+from investigation.target_ref import InvestigationTargetRef
+from models.file_table_model import FileTableModel
 from project.manager import ProjectManager
 from project.models import ProjectMetadata
 from project.modules import ModuleDescriptor, ProjectModule, ProjectModuleContext, ProjectModuleRegistry
 from project.repository import ProjectRepository
 from project.storage import JsonProjectStorage
 from ui.main_window import MainWindow
+from ui.project_save_dialog import ProjectSaveDialog
+from ui.project_save_worker import ProjectSaveWorker
 from ui.project_session_controller import ProjectSessionController
 from ui.project_workflow_controller import ProjectWorkflowController
 
@@ -25,9 +31,9 @@ class _CountingJsonStorage(JsonProjectStorage):
         super().__init__(root, create=create)
         self.full_flush_count = 0
 
-    def flush(self) -> None:
+    def flush(self, progress=None) -> None:
         was_dirty = self.is_dirty or not self._file.is_file()
-        super().flush()
+        super().flush(progress)
         self.full_flush_count += was_dirty
 
 
@@ -43,6 +49,18 @@ class _IdempotentSaveModule(ProjectModule):
 
     def save(self, context: ProjectModuleContext) -> None:
         context.store("state").set("value", "stable")
+
+
+class _LifecycleModule(ProjectModule):
+    def __init__(self) -> None:
+        self.closed = 0
+
+    @property
+    def descriptor(self) -> ModuleDescriptor:
+        return ModuleDescriptor(module_id="lifecycle", schema_version=1)
+
+    def close(self, context: ProjectModuleContext) -> None:
+        self.closed += 1
 
 
 def _application() -> QApplication:
@@ -317,12 +335,243 @@ def test_failed_dirty_close_keeps_the_session_lock(tmp_path, monkeypatch) -> Non
     assert (storage.root / ".carvex.lock").is_dir()
 
 
+def test_background_save_freezes_writes_and_performs_one_flush(tmp_path) -> None:
+    storage = _CountingJsonStorage(tmp_path / "background-save.carvex", create=True)
+    manager = ProjectManager()
+    project = manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    storage.full_flush_count = 0
+    manager.update_metadata(replace(project.metadata, description="modifiée"))
+
+    repository = manager.begin_background_save()
+
+    assert repository is project.repository
+    with pytest.raises(RuntimeError, match="sauvegarde"):
+        project.repository.save_metadata(replace(project.metadata, description="nouvelle valeur"))
+    phases: list[str] = []
+    repository.flush(phases.append)
+    assert not manager.finish_background_save(True)
+
+    assert storage.full_flush_count == 1
+    assert not storage.is_dirty
+    assert {"encoding_models", "serializing_json", "atomic_write"} <= set(phases)
+    manager.close_project()
+
+
+def test_failed_background_close_keeps_project_and_lock(tmp_path, monkeypatch) -> None:
+    storage = _CountingJsonStorage(tmp_path / "background-failure.carvex", create=True)
+    manager = ProjectManager()
+    project = manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    manager.update_metadata(replace(project.metadata, description="modifiée"))
+    repository = manager.begin_background_close()
+    assert repository is project.repository
+    original_write = storage._atomic_write
+
+    def fail_primary(target, payload):
+        if target == storage._file:
+            raise OSError("flush failure")
+        original_write(target, payload)
+
+    monkeypatch.setattr(storage, "_atomic_write", fail_primary)
+    with pytest.raises(OSError, match="flush failure"):
+        repository.flush()
+    assert manager.finish_background_save(False)
+
+    assert manager.active_project is project
+    assert storage.is_dirty
+    assert (storage.root / ".carvex.lock").is_dir()
+    manager.close_project(save=False)
+
+
+def test_successful_background_close_flushes_once_then_releases_lock(tmp_path) -> None:
+    storage = _CountingJsonStorage(tmp_path / "background-close.carvex", create=True)
+    manager = ProjectManager()
+    project = manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    storage.full_flush_count = 0
+    manager.update_metadata(replace(project.metadata, description="modifiée"))
+
+    repository = manager.begin_background_close()
+    assert repository is project.repository
+    repository.flush()
+    assert manager.finish_background_save(True)
+
+    assert storage.full_flush_count == 1
+    assert manager.active_project is None
+    assert not (storage.root / ".carvex.lock").exists()
+
+
+def test_background_close_defers_module_teardown_until_flush_success(tmp_path) -> None:
+    lifecycle = _LifecycleModule()
+    registry = ProjectModuleRegistry()
+    registry.register(lifecycle)
+    storage = _CountingJsonStorage(tmp_path / "deferred-teardown.carvex", create=True)
+    manager = ProjectManager(registry)
+    project = manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    manager.update_metadata(replace(project.metadata, description="modifiée"))
+
+    repository = manager.begin_background_close()
+
+    assert repository is project.repository
+    assert lifecycle.closed == 0
+    repository.flush()
+    assert manager.finish_background_save(True)
+    assert lifecycle.closed == 1
+
+
+def test_investigation_lookup_remains_valid_during_background_close(tmp_path) -> None:
+    storage = _CountingJsonStorage(tmp_path / "investigation-live.carvex", create=True)
+    registry = ProjectModuleRegistry()
+    registry.register(InvestigationProjectModule())
+    manager = ProjectManager(registry)
+    project = manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    service = project.repository.module_repository("investigation", "service")
+    model = FileTableModel(
+        records=({"file_id": "evidence-1", "name": "preuve.jpg"},),
+        investigation_file_lookup=lambda file_id: service.find_item_by_subject("file", file_id) is not None,
+    )
+    manager.update_metadata(replace(project.metadata, description="modifiée"))
+
+    repository = manager.begin_background_close()
+
+    assert repository is project.repository
+    assert model.data(model.index(0, model.INVESTIGATION_COLUMN)) == ""
+    service.find_item_by_subject(InvestigationTargetRef("file", "evidence-1").target_kind, "evidence-1")
+    repository.flush()
+    assert manager.finish_background_save(True)
+    with pytest.raises(RuntimeError, match="Investigation"):
+        service.find_item_by_subject("file", "evidence-1")
+
+
+def test_close_with_async_save_closes_main_window_without_second_click(tmp_path, monkeypatch) -> None:
+    application = _application()
+    storage = _CountingJsonStorage(tmp_path / "window-close.carvex", create=True)
+    window = MainWindow()
+    window.show()
+    application.processEvents()
+    project = window.project_manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    window._attach_project(project, str(storage.root))
+    window.project_manager.update_metadata(replace(project.metadata, description="modifiée"))
+    storage.full_flush_count = 0
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Save)
+
+    window.close()
+    for _ in range(100):
+        if not window.isVisible():
+            break
+        QTest.qWait(20)
+
+    assert not window.isVisible()
+    assert storage.full_flush_count == 1
+    assert window.project_manager.active_project is None
+
+
+def test_failed_async_close_leaves_investigation_operational(tmp_path, monkeypatch) -> None:
+    application = _application()
+    storage = _CountingJsonStorage(tmp_path / "window-failure.carvex", create=True)
+    window = MainWindow()
+    window.show()
+    application.processEvents()
+    project = window.project_manager.create_project(ProjectMetadata("Sauvegarde"), storage)
+    window._attach_project(project, str(storage.root))
+    service = project.repository.module_repository("investigation", "service")
+    window.file_table.set_files(({"file_id": "evidence-1", "name": "preuve.jpg"},))
+    window.project_manager.update_metadata(replace(project.metadata, description="modifiée"))
+    original_write = storage._atomic_write
+
+    def fail_primary(target, payload):
+        if target == storage._file:
+            raise OSError("flush failure")
+        original_write(target, payload)
+
+    errors: list[str] = []
+    monkeypatch.setattr(storage, "_atomic_write", fail_primary)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Save)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *_args: errors.append(str(_args[-1])))
+
+    window.close()
+    for _ in range(100):
+        if window._projects._save_thread is None:
+            break
+        QTest.qWait(20)
+
+    assert window.isVisible()
+    assert window.project_manager.active_project is project
+    assert (storage.root / ".carvex.lock").is_dir()
+    assert service.find_item_by_subject("file", "evidence-1") is None
+    source = window.file_table._source_model
+    assert source.data(source.index(0, source.INVESTIGATION_COLUMN)) == ""
+    assert errors
+    monkeypatch.setattr(storage, "_atomic_write", original_write)
+    window.investigation_panel.detach()
+    window.project_manager.close_project(save=False)
+    window.close()
+
+
+def test_project_save_worker_flushes_outside_the_qt_main_thread() -> None:
+    application = _application()
+    completed = Event()
+    thread_ids: list[int] = []
+    phases: list[str] = []
+
+    class _Repository:
+        def flush(self, progress) -> None:
+            thread_ids.append(get_ident())
+            progress("serializing_json")
+
+    worker = ProjectSaveWorker(_Repository())
+    thread = QThread()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.phase.connect(phases.append)
+    worker.succeeded.connect(completed.set)
+    worker.finished.connect(thread.quit)
+    thread.start()
+    assert completed.wait(2)
+    thread.wait(2_000)
+    application.processEvents()
+
+    assert thread_ids[0] != get_ident()
+    assert phases == ["serializing_json"]
+
+
+def test_save_dialog_is_modal_and_reports_current_phase() -> None:
+    application = _application()
+    dialog = ProjectSaveDialog()
+    dialog.set_phase("Écriture atomique du projet…")
+    dialog.show()
+    application.processEvents()
+
+    assert dialog.isModal()
+    assert dialog._phase.text() == "Écriture atomique du projet…"
+    assert dialog._progress.minimum() == 0
+    assert dialog._progress.maximum() == 0
+    dialog.done(dialog.DialogCode.Accepted)
+
+
+def test_second_project_change_is_rejected_while_a_save_is_active() -> None:
+    calls: list[str] = []
+    workflow = ProjectWorkflowController(
+        None,
+        SimpleNamespace(active_project=object(), is_dirty=True),
+        None,
+        attach_project=lambda *_args: None,
+        clear_project_ui=lambda: None,
+        load_report=lambda *_args: None,
+        capture_workspace=lambda: None,
+        refresh_ui=lambda: None,
+        show_status=calls.append,
+    )
+    workflow._save_thread = object()
+
+    assert not workflow.prepare_project_change()
+    assert calls == ["La sauvegarde en cours doit se terminer avant de changer de projet."]
+
+
 def test_save_choice_closes_once_without_an_explicit_pre_save(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
     manager = SimpleNamespace(
         active_project=object(),
         is_dirty=True,
-        close_project=lambda *, save: calls.append(("close", save)),
+        begin_background_close=lambda: calls.append(("close", True)) or None,
     )
     workflow = ProjectWorkflowController(
         None,
