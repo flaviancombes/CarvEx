@@ -355,6 +355,47 @@ class InvestigationService:
             parent_id=str(collection_id),
         )
 
+    def add_items_to_collection_batch(
+        self,
+        collection_id: InvestigationCollectionId,
+        item_ids: tuple[str, ...],
+        *,
+        added_by: str | None = None,
+    ) -> BatchOperationResult[CollectionMembership]:
+        """Rattache les preuves Investigation existantes à une Collection."""
+        targets = self._item_targets(item_ids)
+        existing = set(self._manager.find_collection_members(collection_id))
+        memberships = tuple(
+            CollectionMembership(
+                membership_id=CollectionMembershipId(str(uuid4())),
+                collection_id=collection_id,
+                target_ref=target,
+                added_by=added_by,
+            )
+            for target in targets
+            if target not in existing
+        )
+        created = self._manager.add_to_collection_batch(memberships)
+        skipped = tuple(
+            CollectionMembership(
+                membership_id=CollectionMembershipId(str(uuid4())),
+                collection_id=collection_id,
+                target_ref=target,
+                added_by=added_by,
+            )
+            for target in targets
+            if target in existing
+        )
+        result = BatchOperationResult(len(item_ids), created, skipped)
+        self._publish(
+            EventType.BATCH_COMPLETED,
+            result.operation_id,
+            parent_kind="collection",
+            parent_id=str(collection_id),
+            created_by=added_by,
+        )
+        return result
+
     def find_collection_members(self, collection_id: InvestigationCollectionId) -> tuple[InvestigationTargetRef, ...]:
         return self._manager.find_collection_members(collection_id)
 
@@ -669,6 +710,47 @@ class InvestigationService:
         )
         return created
 
+    def add_items_to_case_batch(
+        self,
+        case_id: InvestigationCaseId,
+        item_ids: tuple[str, ...],
+        *,
+        added_by: str | None = None,
+    ) -> BatchOperationResult[CaseMembership]:
+        """Rattache les preuves Investigation existantes à une Case."""
+        targets = self._item_targets(item_ids)
+        existing = set(self._manager.find_case_members(case_id))
+        memberships = tuple(
+            CaseMembership(
+                membership_id=CaseMembershipId(str(uuid4())),
+                case_id=case_id,
+                target_ref=target,
+                added_by=added_by,
+            )
+            for target in targets
+            if target not in existing
+        )
+        created = self._manager.add_to_case_batch(memberships)
+        skipped = tuple(
+            CaseMembership(
+                membership_id=CaseMembershipId(str(uuid4())),
+                case_id=case_id,
+                target_ref=target,
+                added_by=added_by,
+            )
+            for target in targets
+            if target in existing
+        )
+        result = BatchOperationResult(len(item_ids), created, skipped)
+        self._publish(
+            EventType.BATCH_COMPLETED,
+            result.operation_id,
+            parent_kind="case",
+            parent_id=str(case_id),
+            created_by=added_by,
+        )
+        return result
+
     def remove_from_case(self, case_id: InvestigationCaseId, target_ref: InvestigationTargetRef) -> None:
         self._manager.remove_from_case(case_id, target_ref)
         self._publish(
@@ -681,6 +763,14 @@ class InvestigationService:
 
     def find_case_members(self, case_id: InvestigationCaseId) -> tuple[InvestigationTargetRef, ...]:
         return self._manager.find_case_members(case_id)
+
+    def _item_targets(self, item_ids: tuple[str, ...]) -> tuple[InvestigationTargetRef, ...]:
+        """Valide et déduplique les preuves à organiser, dans l'ordre utilisateur."""
+        unique_ids = tuple(dict.fromkeys(item_id for item_id in item_ids if item_id))
+        for item_id in unique_ids:
+            if self._manager.get_item(InvestigationItemId(item_id)) is None:
+                raise KeyError(f"InvestigationItem introuvable : {item_id}")
+        return tuple(InvestigationTargetRef("item", item_id) for item_id in unique_ids)
 
     def find_cases_for_target(self, target_ref: InvestigationTargetRef) -> tuple[InvestigationCase, ...]:
         return self._manager.find_cases_for_target(target_ref)

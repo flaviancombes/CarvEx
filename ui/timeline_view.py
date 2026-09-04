@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from time import perf_counter
 
 from PySide6.QtCore import QModelIndex, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -28,13 +30,26 @@ from selection.canonical_entity_resolver import CanonicalEntityResolver
 from selection.file_selection import FileSelectionModel
 from timeline.event import TimelineEvent
 from timeline.manager import TimelineManager
-from timeline.model import TimelineFilterProxyModel, TimelineTableModel
+from timeline.model import TimelineAppendMetrics, TimelineFilterProxyModel, TimelineTableModel
 from timeline.repository import TimelineBuildSession
 from timeline.service import TimelineService
+from timeline.source import EventType
 from ui.background_activity import BackgroundTaskRegistry
 from ui.bookmark_delegate import BookmarkStarDelegate
 from ui.investigation_context_menu import append_investigation_actions
 from utils import performance
+
+
+@dataclass(slots=True)
+class _CheckpointSignals:
+    """Compteurs Qt bornés, actifs uniquement pendant un checkpoint instrumenté."""
+
+    root_insert_signals: int = 0
+    child_insert_signals: int = 0
+    source_model_resets: int = 0
+    proxy_model_resets: int = 0
+    layout_changes: int = 0
+    data_changes: int = 0
 
 
 class _TimelineBuildWorker(QObject):
@@ -52,7 +67,7 @@ class _TimelineBuildWorker(QObject):
         session: TimelineBuildSession,
         generation: int,
         batch_size: int = 2_048,
-        projection_batch_size: int = 32_768,
+        projection_batch_size: int = 12_288,
     ) -> None:
         super().__init__()
         self._session = session
@@ -135,7 +150,11 @@ class TimelineView(QWidget):
         self._worker_completed = False
         self._bulk_projection_active = False
         self._projection_proxy_attached = False
-        self._event_types: dict[str, object] = {}
+        self._checkpoint_signals: _CheckpointSignals | None = None
+        self._checkpoint_signals_connected = False
+        self._checkpoint_index = 0
+        self._checkpoint_cumulative_ms = 0.0
+        self._event_types: dict[str, EventType] = {}
         self._pending_event_type = ""
         self._pending_sort_state: tuple[int, Qt.SortOrder] | None = None
         self._investigation_presence_lookup: Callable[[object], bool] | None = None
@@ -275,6 +294,16 @@ class TimelineView(QWidget):
             self._proxy.sort(-1)
             self._proxy.setDynamicSortFilter(False)
             self._proxy.set_building(True)
+            # QTreeView keeps its header's previous sort section even after the
+            # proxy is unsorted.  Reattaching the source would otherwise make Qt
+            # sort every subsequent insertion while the initial build is active.
+            self.table.setSortingEnabled(False)
+            header = self.table.header()
+            header_signals_blocked = header.blockSignals(True)
+            try:
+                header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            finally:
+                header.blockSignals(header_signals_blocked)
             self._proxy.setSourceModel(None)
             self.table.setUpdatesEnabled(False)
             self._pending_projection_batches.clear()
@@ -282,6 +311,8 @@ class TimelineView(QWidget):
             self._worker_completed = False
             self._bulk_projection_active = True
             self._projection_proxy_attached = False
+            self._checkpoint_index = 0
+            self._checkpoint_cumulative_ms = 0.0
             self._event_types = {}
             thread = QThread(self)
             worker = _TimelineBuildWorker(self._build_session, generation)
@@ -333,11 +364,25 @@ class TimelineView(QWidget):
         self._projection_scheduled = False
         if self._pending_projection_batches:
             events = self._pending_projection_batches.popleft()
+            checkpoint_started_at = perf_counter() if performance.ENABLED else 0.0
+            self._begin_checkpoint_observation()
+            self._proxy.reset_performance_less_than_calls()
             with performance.operation("TimelineView", "project_checkpoint"):
-                self._model.append_events(events)
+                metrics = self._model.append_events(events)
+                event_types_started_at = perf_counter() if performance.ENABLED else 0.0
                 for event in events:
                     self._event_types.setdefault(event.event_type.identifier, event.event_type)
+                event_types_ms = (perf_counter() - event_types_started_at) * 1000 if performance.ENABLED else 0.0
+                view_update_started_at = perf_counter() if performance.ENABLED else 0.0
                 self._attach_projection_proxy()
+                view_update_ms = (perf_counter() - view_update_started_at) * 1000 if performance.ENABLED else 0.0
+            self._finish_checkpoint_observation(
+                checkpoint_started_at,
+                metrics,
+                event_types_ms,
+                view_update_ms,
+                len(self._pending_projection_batches),
+            )
             self._schedule_projection()
             return
         if self._worker_completed:
@@ -349,6 +394,7 @@ class TimelineView(QWidget):
         self._attach_projection_proxy()
         self._proxy.setDynamicSortFilter(True)
         self._proxy.set_building(False)
+        self.table.setSortingEnabled(True)
         self._bulk_projection_active = False
         self._build_worker = None
         self._build_thread = None
@@ -378,6 +424,147 @@ class TimelineView(QWidget):
         self.table.setUpdatesEnabled(True)
         self.table.viewport().update()
         self._projection_proxy_attached = True
+
+    def _begin_checkpoint_observation(self) -> None:
+        if not performance.ENABLED:
+            return
+        if not self._checkpoint_signals_connected:
+            self._model.rowsInserted.connect(self._record_checkpoint_insert)
+            self._model.modelReset.connect(self._record_checkpoint_source_model_reset)
+            self._model.layoutChanged.connect(self._record_checkpoint_layout_change)
+            self._model.dataChanged.connect(self._record_checkpoint_data_change)
+            self._proxy.modelReset.connect(self._record_checkpoint_proxy_model_reset)
+            self._proxy.layoutChanged.connect(self._record_checkpoint_layout_change)
+            self._proxy.dataChanged.connect(self._record_checkpoint_data_change)
+            self._checkpoint_signals_connected = True
+        self._checkpoint_signals = _CheckpointSignals()
+
+    def _finish_checkpoint_observation(
+        self,
+        started_at: float,
+        metrics: TimelineAppendMetrics,
+        event_types_ms: float,
+        view_update_ms: float,
+        queued_batch_count: int,
+    ) -> None:
+        if not performance.ENABLED:
+            return
+        signals = self._checkpoint_signals or _CheckpointSignals()
+        self._checkpoint_signals = None
+        duration_ms = (perf_counter() - started_at) * 1000
+        self._checkpoint_index += 1
+        self._checkpoint_cumulative_ms += duration_ms
+        selection = self.table.selectionModel()
+        selection_count = len(selection.selectedRows()) if selection is not None else 0
+        current_index = self.table.currentIndex()
+        performance.LOGGER.info(
+            "[TimelineCheckpoint] duration_ms=%.2f checkpoint_index=%d cumulative_ms=%.2f "
+            "pending_events=%d queued_batches=%d unique_events=%d duplicates=%d event_types=%d "
+            "empty_event_ids=%d max_event_id_length=%d inserted_parents=%d "
+            "existing_parents=%d inserted_children=%d insert_signals=%d root_insert_signals=%d "
+            "child_insert_signals=%d source_model_reset=%d proxy_model_reset=%d "
+            "layout_changed=%d data_changed=%d "
+            "prepare_delta_ms=%.2f parent_lookup_ms=%.2f model_insert_ms=%.2f "
+            "begin_insert_ms=%.2f index_update_ms=%.2f end_insert_ms=%.2f node_create_ms=%.2f "
+            "event_index_ms=%.2f event_list_append_ms=%.2f event_ordering_ms=%.2f "
+            "event_id_lookup_ms=%.2f event_id_insert_ms=%.2f event_id_index_ms=%.2f "
+            "bookmark_index_ms=%.2f event_index_residual_ms=%.2f "
+            "event_index_size_before=%d event_index_size_after=%d event_dict_bytes_before=%d "
+            "event_dict_bytes_after=%d event_dict_bytes_delta=%d event_index_new_keys=%d "
+            "event_index_existing_keys=%d event_list_bytes_delta=%d "
+            "bookmark_index_size_before=%d bookmark_index_size_after=%d bookmark_dict_bytes_before=%d "
+            "bookmark_dict_bytes_after=%d bookmark_dict_bytes_delta=%d bookmark_set_bytes_delta=%d "
+            "gc_count_before=%s gc_count_after=%s gc_collections=%s gc_gen0_ms=%.2f "
+            "gc_gen1_ms=%.2f gc_gen2_ms=%.2f gc_total_ms=%.2f "
+            "event_type_update_ms=%.2f view_update_ms=%.2f less_than_calls=%d "
+            "selection_count=%d current_index_valid=%s proxy_attached=%s",
+            duration_ms,
+            self._checkpoint_index,
+            self._checkpoint_cumulative_ms,
+            metrics.input_event_count,
+            queued_batch_count,
+            metrics.unique_event_count,
+            metrics.duplicate_event_count,
+            metrics.event_type_count,
+            metrics.empty_event_id_count,
+            metrics.max_event_id_length,
+            metrics.inserted_parent_count,
+            metrics.existing_parent_count,
+            metrics.inserted_child_count,
+            metrics.insert_signal_count,
+            signals.root_insert_signals,
+            signals.child_insert_signals,
+            signals.source_model_resets,
+            signals.proxy_model_resets,
+            signals.layout_changes,
+            signals.data_changes,
+            metrics.prepare_delta_ms,
+            metrics.parent_lookup_ms,
+            metrics.model_insert_ms,
+            metrics.begin_insert_ms,
+            metrics.index_update_ms,
+            metrics.end_insert_ms,
+            metrics.node_create_ms,
+            metrics.event_index_ms,
+            metrics.event_list_append_ms,
+            metrics.event_ordering_ms,
+            metrics.event_id_lookup_ms,
+            metrics.event_id_insert_ms,
+            metrics.event_id_index_ms,
+            metrics.bookmark_index_ms,
+            metrics.event_index_residual_ms,
+            metrics.event_index_size_before,
+            metrics.event_index_size_after,
+            metrics.event_dict_bytes_before,
+            metrics.event_dict_bytes_after,
+            metrics.event_dict_bytes_after - metrics.event_dict_bytes_before,
+            metrics.event_index_new_key_count,
+            metrics.event_index_existing_key_count,
+            metrics.event_list_bytes_delta,
+            metrics.bookmark_index_size_before,
+            metrics.bookmark_index_size_after,
+            metrics.bookmark_dict_bytes_before,
+            metrics.bookmark_dict_bytes_after,
+            metrics.bookmark_dict_bytes_after - metrics.bookmark_dict_bytes_before,
+            metrics.bookmark_set_bytes_delta,
+            metrics.event_index_gc_count_before,
+            metrics.event_index_gc_count_after,
+            metrics.event_index_gc_collections,
+            metrics.event_index_gc_duration_ms[0],
+            metrics.event_index_gc_duration_ms[1],
+            metrics.event_index_gc_duration_ms[2],
+            sum(metrics.event_index_gc_duration_ms),
+            event_types_ms,
+            view_update_ms,
+            self._proxy.performance_less_than_calls(),
+            selection_count,
+            current_index.isValid(),
+            self._projection_proxy_attached,
+        )
+
+    def _record_checkpoint_insert(self, parent: QModelIndex, _first: int, _last: int) -> None:
+        if self._checkpoint_signals is None:
+            return
+        if parent.isValid():
+            self._checkpoint_signals.child_insert_signals += 1
+        else:
+            self._checkpoint_signals.root_insert_signals += 1
+
+    def _record_checkpoint_source_model_reset(self) -> None:
+        if self._checkpoint_signals is not None:
+            self._checkpoint_signals.source_model_resets += 1
+
+    def _record_checkpoint_proxy_model_reset(self) -> None:
+        if self._checkpoint_signals is not None:
+            self._checkpoint_signals.proxy_model_resets += 1
+
+    def _record_checkpoint_layout_change(self, *_args) -> None:
+        if self._checkpoint_signals is not None:
+            self._checkpoint_signals.layout_changes += 1
+
+    def _record_checkpoint_data_change(self, *_args) -> None:
+        if self._checkpoint_signals is not None:
+            self._checkpoint_signals.data_changes += 1
 
     @Slot(int, str)
     def _fail_build(self, generation: int, _message: str) -> None:

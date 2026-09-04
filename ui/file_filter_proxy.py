@@ -40,6 +40,29 @@ class _CategoryFilterProfile:
     source_role_accesses_start: dict[int, int] | None = None
 
 
+@dataclass(slots=True)
+class _CorrelationFilterProfile:
+    """Mesure agrégée d'une invalidation déclenchée par les filtres Corrélations."""
+
+    source_rows: int
+    match_count: int | None
+    started_at: float
+    thread_name: str
+    filter_calls: int = 0
+    accepted_rows: int = 0
+    rejected_rows: int = 0
+    sort_calls: int = 0
+    model_resets: int = 0
+    layout_changes: int = 0
+    data_changes: int = 0
+    filter_sample_calls: int = 0
+    filter_sample_seconds: float = 0.0
+    sort_sample_calls: int = 0
+    sort_sample_seconds: float = 0.0
+    source_data_accesses_start: int = 0
+    source_role_accesses_start: dict[int, int] | None = None
+
+
 class ArtifactCacheLookup(Protocol):
     """Contrat de lecture : il ne déclenche jamais de calcul d'artefacts."""
 
@@ -78,6 +101,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         self._correlation_matches: frozenset[str] | None = None
         self._universal_matches: frozenset[str] = frozenset()
         self._category_profile: _CategoryFilterProfile | None = None
+        self._correlation_profile: _CorrelationFilterProfile | None = None
         self._text_collator = QCollator()
         self._text_collator.setCaseSensitivity(Qt.CaseSensitivity.CaseSensitive)
         self.setDynamicSortFilter(True)
@@ -181,9 +205,28 @@ class FileFilterProxyModel(QSortFilterProxyModel):
     def set_correlation_matches(self, matches: frozenset[str] | None) -> None:
         if matches == self._correlation_matches:
             return
+        self._finish_category_profile()
+        self._finish_correlation_profile()
+        model = self.sourceModel()
+        self._correlation_profile = (
+            _CorrelationFilterProfile(
+                source_rows=model.rowCount() if isinstance(model, FileTableModel) else 0,
+                match_count=None if matches is None else len(matches),
+                started_at=perf_counter(),
+                thread_name=current_thread().name,
+            )
+            if performance.ENABLED
+            else None
+        )
+        if self._correlation_profile is not None and isinstance(model, FileTableModel):
+            accesses, roles = model.performance_data_accesses()
+            self._correlation_profile.source_data_accesses_start = accesses
+            self._correlation_profile.source_role_accesses_start = roles
         self.beginFilterChange()
         self._correlation_matches = matches
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+        if self._correlation_profile is not None:
+            QTimer.singleShot(0, self._schedule_correlation_profile_finish)
 
     @property
     def artifact_filter(self) -> str:
@@ -198,14 +241,20 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         self._artifact_matches.clear()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
-        profile = self._category_profile
+        profile = self._category_profile or self._correlation_profile
         if profile is not None:
             profile.filter_calls += 1
             sample_started = perf_counter() if profile.filter_calls % 1024 == 1 else None
         else:
             sample_started = None
         try:
-            return self._filter_accepts_row(source_row, source_parent, profile)
+            accepted = self._filter_accepts_row(source_row, source_parent, self._category_profile)
+            if self._correlation_profile is not None:
+                if accepted:
+                    self._correlation_profile.accepted_rows += 1
+                else:
+                    self._correlation_profile.rejected_rows += 1
+            return accepted
         finally:
             if sample_started is not None and profile is not None:
                 profile.filter_sample_calls += 1
@@ -223,8 +272,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
                 profile.other_rejections += 1
             return False
         filter_row = model.filter_row_at(source_row)
-        record = model.record_at(source_row)
-        if filter_row is None or record is None:
+        if filter_row is None:
             if profile is not None:
                 profile.other_rejections += 1
             return False
@@ -255,6 +303,11 @@ class FileFilterProxyModel(QSortFilterProxyModel):
                 if profile is not None:
                     profile.other_rejections += 1
                 return False
+            record = model.record_at(source_row)
+            if record is None:
+                if profile is not None:
+                    profile.other_rejections += 1
+                return False
             if not self._matches_artifact(filter_row.file_id, record):
                 if profile is not None:
                     profile.other_rejections += 1
@@ -274,7 +327,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         return accepted
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
-        profile = self._category_profile
+        profile = self._category_profile or self._correlation_profile
         if profile is not None:
             profile.sort_calls += 1
             sample_started = perf_counter() if profile.sort_calls % 1024 == 1 else None
@@ -342,14 +395,20 @@ class FileFilterProxyModel(QSortFilterProxyModel):
     def _record_model_reset(self) -> None:
         if self._category_profile is not None:
             self._category_profile.model_resets += 1
+        if self._correlation_profile is not None:
+            self._correlation_profile.model_resets += 1
 
     def _record_layout_change(self) -> None:
         if self._category_profile is not None:
             self._category_profile.layout_changes += 1
+        if self._correlation_profile is not None:
+            self._correlation_profile.layout_changes += 1
 
     def _record_data_change(self, *_args) -> None:
         if self._category_profile is not None:
             self._category_profile.data_changes += 1
+        if self._correlation_profile is not None:
+            self._correlation_profile.data_changes += 1
 
     def _schedule_category_profile_finish(self) -> None:
         QTimer.singleShot(0, self._finish_category_profile)
@@ -402,6 +461,59 @@ class FileFilterProxyModel(QSortFilterProxyModel):
             role_accesses,
             self._metadata_matches is not None,
             self._correlation_matches is not None,
+            bool(self._search_text),
+            bool(self._artifact_filter),
+        )
+
+    def _schedule_correlation_profile_finish(self) -> None:
+        QTimer.singleShot(0, self._finish_correlation_profile)
+
+    def _finish_correlation_profile(self) -> None:
+        profile = self._correlation_profile
+        if profile is None:
+            return
+        self._correlation_profile = None
+        model = self.sourceModel()
+        if isinstance(model, FileTableModel):
+            source_rows = model.rowCount()
+            current_accesses, current_roles = model.performance_data_accesses()
+            data_accesses = current_accesses - profile.source_data_accesses_start
+            role_accesses = {
+                role: count - (profile.source_role_accesses_start or {}).get(role, 0)
+                for role, count in current_roles.items()
+                if count > (profile.source_role_accesses_start or {}).get(role, 0)
+            }
+        else:
+            source_rows = 0
+            data_accesses = 0
+            role_accesses = {}
+        performance.LOGGER.info(
+            "[CorrelationsFilter] model_update duration_ms=%.2f thread=%s source_rows=%d "
+            "source_rows_at_start=%d correlation_matches=%s filter_calls=%d accepted=%d rejected=%d "
+            "sort_calls=%d model_reset=%d layout_changed=%d data_changed=%d "
+            "filter_sample_ms=%.2f filter_estimated_ms=%.2f sort_sample_ms=%.2f "
+            "sort_estimated_ms=%.2f source_data_accesses=%d source_roles=%s "
+            "metadata_filter_active=%s category_filter_active=%s search_active=%s artifact_filter_active=%s",
+            (perf_counter() - profile.started_at) * 1000,
+            profile.thread_name,
+            source_rows,
+            profile.source_rows,
+            profile.match_count,
+            profile.filter_calls,
+            profile.accepted_rows,
+            profile.rejected_rows,
+            profile.sort_calls,
+            profile.model_resets,
+            profile.layout_changes,
+            profile.data_changes,
+            profile.filter_sample_seconds * 1000,
+            profile.filter_sample_seconds * 1000 * 1024,
+            profile.sort_sample_seconds * 1000,
+            profile.sort_sample_seconds * 1000 * 1024,
+            data_accesses,
+            role_accesses,
+            self._metadata_matches is not None,
+            bool(self._category),
             bool(self._search_text),
             bool(self._artifact_filter),
         )

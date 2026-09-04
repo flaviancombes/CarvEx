@@ -84,7 +84,7 @@ class InvestigationTreeView(QTreeView):
         self.setColumnWidth(0, 300)
         self.setColumnWidth(1, 170)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
@@ -146,6 +146,21 @@ class InvestigationTreeView(QTreeView):
     def _entry_at(self, index: QModelIndex) -> InvestigationTreeEntry | None:
         model = self.model()
         return model.entry_for_index(index) if isinstance(model, InvestigationTreeModel) else None
+
+    def selected_item_entries(self) -> tuple[InvestigationTreeEntry, ...]:
+        """Retourne les preuves sélectionnées, dédupliquées dans l'ordre des lignes."""
+        selection = self.selectionModel()
+        model = self.model()
+        if selection is None or not isinstance(model, InvestigationTreeModel):
+            return ()
+        entries: list[InvestigationTreeEntry] = []
+        seen: set[str] = set()
+        for index in sorted(selection.selectedRows(0), key=lambda value: (value.parent().row(), value.row())):
+            entry = model.entry_for_index(index)
+            if entry is not None and entry.subject_kind == "item" and entry.subject_id not in seen:
+                entries.append(entry)
+                seen.add(entry.subject_id)
+        return tuple(entries)
 
 
 class InvestigationController(QObject):
@@ -446,11 +461,18 @@ class InvestigationController(QObject):
         return ()
 
     def add_to_container(self, entry: InvestigationTreeEntry, container_kind: str, container_id: str) -> None:
-        target = InvestigationTargetRef(entry.subject_kind, entry.subject_id)
+        self.add_items_to_container((entry,), container_kind, container_id)
+
+    def add_items_to_container(
+        self, entries: tuple[InvestigationTreeEntry, ...], container_kind: str, container_id: str
+    ) -> None:
+        item_ids = tuple(dict.fromkeys(entry.subject_id for entry in entries if entry.subject_kind == "item"))
+        if not item_ids:
+            raise ValueError("Sélectionnez au moins une preuve Investigation.")
         if container_kind == "case":
-            self._service.add_to_case(InvestigationCaseId(container_id), target)
+            self._service.add_items_to_case_batch(InvestigationCaseId(container_id), item_ids)
         elif container_kind == "collection":
-            self._service.add_to_collection(InvestigationCollectionId(container_id), target)
+            self._service.add_items_to_collection_batch(InvestigationCollectionId(container_id), item_ids)
         else:
             raise ValueError(f"Type de conteneur non pris en charge : {container_kind}")
 
@@ -486,16 +508,6 @@ class InvestigationController(QObject):
                 if event.parent_kind == "items" and self._model.is_loaded(InvestigationSection.ITEMS):
                     with performance.measure("InvestigationController.refresh_items"):
                         self.refresh_section(InvestigationSection.ITEMS)
-                elif event.parent_kind == "collection":
-                    if self._model.is_loaded(InvestigationSection.COLLECTIONS):
-                        with performance.measure("InvestigationController.refresh_collections"):
-                            self.refresh_section(InvestigationSection.COLLECTIONS)
-                    if self._model.is_loaded(InvestigationSection.ITEMS):
-                        with performance.measure("InvestigationController.refresh_items"):
-                            self.refresh_section(InvestigationSection.ITEMS)
-                if self._model.is_loaded(InvestigationSection.JOURNAL):
-                    with performance.measure("InvestigationController.refresh_journal"):
-                        self.refresh_section(InvestigationSection.JOURNAL)
                 self.item_presence_changed.emit(self._has_tree_content())
             return
         section = self._SECTIONS_BY_EVENT.get(event.event_type)
@@ -938,20 +950,31 @@ class InvestigationPanel(QWidget):
         )
 
     def _show_organization_menu(self, entry: InvestigationTreeEntry, position: QPoint) -> None:
-        if self._controller is None or entry.subject_kind not in {"item", "note", "hypothesis"}:
+        if self._controller is None:
             return
-        self._organization_menu(entry).exec(position)
+        entries = self.tree.selected_item_entries()
+        if entry.subject_kind == "item" and entry.subject_id not in {selected.subject_id for selected in entries}:
+            entries = (entry,)
+        if not entries:
+            return
+        self._organization_menu(entries).exec(position)
 
-    def _organization_menu(self, entry: InvestigationTreeEntry) -> QMenu:
+    def _organization_menu(self, entries: InvestigationTreeEntry | tuple[InvestigationTreeEntry, ...]) -> QMenu:
         """Construit le menu contextuel ; isolé pour rester testable sans boucle modale."""
+        selected = (entries,) if isinstance(entries, InvestigationTreeEntry) else entries
+        count = len(selected)
         menu = QMenu(self)
-        case_action = menu.addAction("Ajouter à une Case...")
-        collection_action = menu.addAction("Ajouter à une Collection...")
-        case_action.triggered.connect(lambda: self._choose_container(entry, "case"))
-        collection_action.triggered.connect(lambda: self._choose_container(entry, "collection"))
+        suffix = "" if count == 1 else f" {count} preuves"
+        case_action = menu.addAction(f"Ajouter{suffix} à une Case...")
+        collection_action = menu.addAction(f"Ajouter{suffix} à une Collection...")
+        if self._controller is not None:
+            case_action.setEnabled(bool(self._controller.container_options("case")))
+            collection_action.setEnabled(bool(self._controller.container_options("collection")))
+        case_action.triggered.connect(lambda: self._choose_container(selected, "case"))
+        collection_action.triggered.connect(lambda: self._choose_container(selected, "collection"))
         return menu
 
-    def _choose_container(self, entry: InvestigationTreeEntry, container_kind: str) -> None:
+    def _choose_container(self, entries: tuple[InvestigationTreeEntry, ...], container_kind: str) -> None:
         if self._controller is None:
             return
         is_case = container_kind == "case"
@@ -964,7 +987,12 @@ class InvestigationPanel(QWidget):
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         try:
-            self._controller.organize_entry(entry, container_kind, str(dialog.container_field.currentData()))
+            with performance.measure("InvestigationMembershipBulk.action", selected=len(entries)):
+                container_id = str(dialog.container_field.currentData())
+                if len(entries) == 1:
+                    self._controller.organize_entry(entries[0], container_kind, container_id)
+                else:
+                    self._controller.add_items_to_container(entries, container_kind, container_id)
         except ValueError as error:
             QMessageBox.warning(self, "Organisation impossible", str(error))
 

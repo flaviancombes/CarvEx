@@ -417,6 +417,13 @@ class InvestigationRepository:
             raise ValueError(f"CaseMembership déjà existant : {membership.membership_id}")
         self._case_memberships.set(str(membership.membership_id), membership)
 
+    def create_case_memberships_batch(self, memberships: tuple[CaseMembership, ...]) -> None:
+        self._create_many(
+            self._case_memberships,
+            ((str(membership.membership_id), membership) for membership in memberships),
+            "CaseMembership",
+        )
+
     def delete_case_membership(self, membership_id: CaseMembershipId) -> None:
         if self.get_case_membership(membership_id) is None:
             raise KeyError(f"CaseMembership introuvable : {membership_id}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Callable
+from time import perf_counter
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from metadata.correlation import MetadataCorrelation, MetadataCorrelationIndex, MetadataCorrelationType
+from utils import performance
 
 _ANOMALY_TYPES = frozenset(
     {
@@ -70,7 +72,7 @@ class CorrelationFilterPanel(QGroupBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Filtres corrélations", parent)
         self._index: MetadataCorrelationIndex | None = None
-        self._all_file_ids = frozenset()
+        self._all_file_ids: frozenset[str] = frozenset()
         self._files_by_type: dict[MetadataCorrelationType, frozenset[str]] = {}
         self._tokens: dict[str, frozenset[str]] = {}
         self._scope: frozenset[str] | None = None
@@ -99,6 +101,8 @@ class CorrelationFilterPanel(QGroupBox):
 
     def set_index(self, index: MetadataCorrelationIndex | None) -> None:
         """Construit une projection locale une seule fois, sans moteur ni Store."""
+        started_at = perf_counter() if performance.ENABLED else 0.0
+        correlation_count = 0
         self._index = index
         self._all_file_ids = frozenset()
         self._files_by_type = {}
@@ -110,6 +114,7 @@ class CorrelationFilterPanel(QGroupBox):
             tokens: dict[str, set[str]] = defaultdict(set)
             all_file_ids: set[str] = set()
             for correlation in index.all():
+                correlation_count += 1
                 file_ids = set(correlation.file_ids)
                 all_file_ids.update(file_ids)
                 by_type[correlation.correlation_type].update(file_ids)
@@ -120,6 +125,16 @@ class CorrelationFilterPanel(QGroupBox):
             self._tokens = {token: frozenset(file_ids) for token, file_ids in tokens.items()}
             self._create_type_checks()
         self.setVisible(bool(self._all_file_ids))
+        if performance.ENABLED:
+            performance.LOGGER.info(
+                "[CorrelationsFilter] projection duration_ms=%.2f correlations_examined=%d "
+                "correlated_files=%d types=%d tokens=%d",
+                (perf_counter() - started_at) * 1000,
+                correlation_count,
+                len(self._all_file_ids),
+                len(self._files_by_type),
+                len(self._tokens),
+            )
         self._emit_matches()
 
     def show_related_to(self, file_id: str) -> None:
@@ -178,29 +193,69 @@ class CorrelationFilterPanel(QGroupBox):
         self._type_checks.clear()
 
     def _emit_matches(self, *_args) -> None:
+        started_at = perf_counter() if performance.ENABLED else 0.0
         if not self._all_file_ids:
+            self._log_filter_resolution(started_at, 0, 0, ())
             self.matches_changed.emit(None)
+            self._log_filter_action(started_at, None)
             return
         selected_types = {kind for kind, check in self._type_checks.items() if check.isChecked()}
         if self.anomalies_only.isChecked():
             selected_types.update(_ANOMALY_TYPES.intersection(self._files_by_type))
         tokens = tuple(token for token in re.findall(r"[\w]+", self.search.text().casefold()) if token)
         if not (self.correlated_only.isChecked() or selected_types or tokens or self._scope is not None):
+            self._log_filter_resolution(started_at, 0, 0, tokens)
             self.matches_changed.emit(None)
+            self._log_filter_action(started_at, None)
             return
-        matches = set(self._all_file_ids)
-        if self.correlated_only.isChecked() or selected_types:
-            type_matches: set[str] = set()
-            for correlation_type in selected_types:
-                type_matches.update(self._files_by_type.get(correlation_type, ()))
-            if self.correlated_only.isChecked() and not selected_types:
-                type_matches.update(self._all_file_ids)
-            matches.intersection_update(type_matches)
+        if selected_types:
+            matches: frozenset[str] | set[str] = frozenset().union(
+                *(self._files_by_type.get(correlation_type, ()) for correlation_type in selected_types)
+            )
+        else:
+            # Cas courant : l'index local représente déjà exactement le résultat.
+            # Ne pas recopier potentiellement plusieurs centaines de milliers d'identifiants.
+            matches = self._all_file_ids
         for token in tokens:
-            matches.intersection_update(self._tokens.get(token, ()))
+            matches = matches.intersection(self._tokens.get(token, ()))
         if self._scope is not None:
-            matches.intersection_update(self._scope)
-        self.matches_changed.emit(frozenset(matches))
+            matches = matches.intersection(self._scope)
+        self._log_filter_resolution(started_at, len(matches), len(selected_types), tokens)
+        resolved_matches = matches if isinstance(matches, frozenset) else frozenset(matches)
+        self.matches_changed.emit(resolved_matches)
+        self._log_filter_action(started_at, len(resolved_matches))
+
+    def _log_filter_resolution(
+        self,
+        started_at: float,
+        match_count: int,
+        selected_type_count: int,
+        tokens: tuple[str, ...],
+    ) -> None:
+        """Journalise le seul travail de résolution local, sans mesurer le proxy Qt."""
+        if not performance.ENABLED:
+            return
+        performance.LOGGER.info(
+            "[CorrelationsFilter] resolve_state duration_ms=%.2f correlations_indexed=%d "
+            "correlated_files=%d matches=%d selected_types=%d tokens=%d scoped=%s",
+            (perf_counter() - started_at) * 1000,
+            len(self._files_by_type),
+            len(self._all_file_ids),
+            match_count,
+            selected_type_count,
+            len(tokens),
+            self._scope is not None,
+        )
+
+    @staticmethod
+    def _log_filter_action(started_at: float, match_count: int | None) -> None:
+        """Mesure le chemin synchrone clic → proxy, hors tâches Qt différées."""
+        if performance.ENABLED:
+            performance.LOGGER.info(
+                "[CorrelationsFilter] action duration_ms=%.2f emitted_matches=%s",
+                (perf_counter() - started_at) * 1000,
+                match_count,
+            )
 
     @staticmethod
     def _tokens_for(correlation: MetadataCorrelation) -> frozenset[str]:
@@ -286,14 +341,16 @@ class CorrelationPanel(QGroupBox):
                 item.widget().deleteLater()
 
     def expanded_types(self) -> tuple[str, ...]:
-        return tuple(
-            self.tree.topLevelItem(index).text(0)
-            for index in range(self.tree.topLevelItemCount())
-            if self.tree.topLevelItem(index).isExpanded()
-        )
+        labels: list[str] = []
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is not None and item.isExpanded():
+                labels.append(item.text(0))
+        return tuple(labels)
 
     def restore_expanded_types(self, labels: tuple[str, ...]) -> None:
         wanted = frozenset(labels)
         for index in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(index)
-            item.setExpanded(item.text(0) in wanted)
+            if item is not None:
+                item.setExpanded(item.text(0) in wanted)

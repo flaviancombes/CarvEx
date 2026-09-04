@@ -8,8 +8,12 @@ indentation textuelle ne simule la hiérarchie.
 
 from __future__ import annotations
 
+import gc
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from threading import get_ident
+from time import perf_counter
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, QSortFilterProxyModel, Qt
 
@@ -20,6 +24,7 @@ from selection.file_selection import FileSelectionChange, FileSelectionModel
 from timeline.event import TimelineEvent
 from timeline.filters import searchable_text
 from timeline.manager import TimelineManager
+from utils import performance
 
 
 @dataclass(slots=True)
@@ -30,6 +35,96 @@ class _FileNode:
     row: int
     events: list[TimelineEvent] = field(default_factory=list)
     earliest_event: TimelineEvent | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineAppendMetrics:
+    """Mesures agrégées d'une projection incrémentale, sans état Qt supplémentaire."""
+
+    input_event_count: int
+    unique_event_count: int
+    duplicate_event_count: int
+    event_type_count: int
+    empty_event_id_count: int
+    max_event_id_length: int
+    inserted_parent_count: int
+    existing_parent_count: int
+    inserted_child_count: int
+    insert_signal_count: int
+    prepare_delta_ms: float
+    parent_lookup_ms: float
+    model_insert_ms: float
+    begin_insert_ms: float
+    index_update_ms: float
+    end_insert_ms: float
+    node_create_ms: float
+    event_index_ms: float
+    event_list_append_ms: float
+    event_ordering_ms: float
+    event_id_lookup_ms: float
+    event_id_insert_ms: float
+    event_id_index_ms: float
+    bookmark_index_ms: float
+    event_index_residual_ms: float
+    event_index_size_before: int
+    event_index_size_after: int
+    event_dict_bytes_before: int
+    event_dict_bytes_after: int
+    event_index_new_key_count: int
+    event_index_existing_key_count: int
+    event_list_bytes_delta: int
+    bookmark_index_size_before: int
+    bookmark_index_size_after: int
+    bookmark_dict_bytes_before: int
+    bookmark_dict_bytes_after: int
+    bookmark_set_bytes_delta: int
+    event_index_gc_count_before: tuple[int, int, int]
+    event_index_gc_count_after: tuple[int, int, int]
+    event_index_gc_collections: tuple[int, int, int]
+    event_index_gc_duration_ms: tuple[float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _EventIndexMetrics:
+    """Mesures internes agrégées d'une insertion d'événements par parent."""
+
+    list_append_ms: float = 0.0
+    ordering_ms: float = 0.0
+    event_id_lookup_ms: float = 0.0
+    event_id_insert_ms: float = 0.0
+    bookmark_index_ms: float = 0.0
+    event_id_new_key_count: int = 0
+    event_id_existing_key_count: int = 0
+    event_list_bytes_delta: int = 0
+    bookmark_set_bytes_delta: int = 0
+
+
+@dataclass(slots=True)
+class _GCCheckpointObserver:
+    """Mesure les GC synchrones du thread qui projette le checkpoint."""
+
+    thread_id: int
+    started_at: dict[int, float] = field(default_factory=dict)
+    event_index_duration_ms: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    active_scope: str | None = None
+
+    def __call__(self, phase: str, info: dict[str, int]) -> None:
+        if get_ident() != self.thread_id:
+            return
+        generation = info.get("generation")
+        if generation not in (0, 1, 2):
+            return
+        if phase == "start":
+            self.started_at[generation] = perf_counter()
+            return
+        if phase != "stop":
+            return
+        started_at = self.started_at.pop(generation, None)
+        if started_at is None:
+            return
+        duration_ms = (perf_counter() - started_at) * 1000
+        if self.active_scope == "event_index":
+            self.event_index_duration_ms[generation] += duration_ms
 
 
 class TimelineTreeModel(QAbstractItemModel):
@@ -72,37 +167,196 @@ class TimelineTreeModel(QAbstractItemModel):
             self._append_to_indexes(event)
         self.endResetModel()
 
-    def append_events(self, events: Sequence[TimelineEvent]) -> None:
+    def append_events(self, events: Sequence[TimelineEvent]) -> TimelineAppendMetrics:
         """Adds only the rows changed by one lazy-loading batch."""
-        grouped: dict[str, list[TimelineEvent]] = {}
-        for event in self._new_events(events):
-            grouped.setdefault(self._file_key(event), []).append(event)
+        observer = self._start_gc_observer()
+        try:
+            return self._append_events(events, observer)
+        finally:
+            self._stop_gc_observer(observer)
 
-        new_groups: list[tuple[str, list[TimelineEvent]]] = []
-        existing_groups: list[tuple[_FileNode, list[TimelineEvent]]] = []
+    def _append_events(
+        self, events: Sequence[TimelineEvent], gc_observer: _GCCheckpointObserver | None
+    ) -> TimelineAppendMetrics:
+        """Projette le delta en gardant le callback GC borné au checkpoint courant."""
+        started_at = perf_counter() if performance.ENABLED else 0.0
+        unique_events = self._new_events(events)
+        prepared_at = perf_counter() if performance.ENABLED else 0.0
+        duplicate_event_count = len(events) - len(unique_events)
+        event_type_count = len({event.event_type.identifier for event in unique_events}) if performance.ENABLED else 0
+        empty_event_id_count = sum(not event.event_id for event in unique_events) if performance.ENABLED else 0
+        max_event_id_length = (
+            max((len(event.event_id) for event in unique_events), default=0) if performance.ENABLED else 0
+        )
+        grouped: dict[str, list[TimelineEvent]] = {}
+        bookmark_keys: dict[str, BookmarkKey | None] = {}
+        identities_by_record: dict[int, tuple[str, BookmarkKey | None]] = {}
+        for event in unique_events:
+            record_identity = id(event.file_record) if event.file_record is not None else id(event)
+            resolved = identities_by_record.get(record_identity)
+            if resolved is None:
+                file_id = self._entity_resolver.file_id_for(event)
+                key = file_id or event.event_id
+                resolved = key, BookmarkKey("file", file_id) if file_id is not None else None
+                identities_by_record[record_identity] = resolved
+            key, bookmark_key = resolved
+            grouped.setdefault(key, []).append(event)
+            bookmark_keys.setdefault(key, bookmark_key)
+
+        new_groups: list[tuple[str, BookmarkKey | None, list[TimelineEvent]]] = []
+        existing_groups: list[tuple[_FileNode, BookmarkKey | None, list[TimelineEvent]]] = []
         for key, group in grouped.items():
+            bookmark_key = bookmark_keys[key]
             node = self._nodes_by_key.get(key)
             if node is None:
-                new_groups.append((key, group))
+                new_groups.append((key, bookmark_key, group))
             else:
-                existing_groups.append((node, group))
+                existing_groups.append((node, bookmark_key, group))
+
+        looked_up_at = perf_counter() if performance.ENABLED else 0.0
+        begin_insert_ms = 0.0
+        index_update_ms = 0.0
+        end_insert_ms = 0.0
+        node_create_ms = 0.0
+        event_index_ms = 0.0
+        event_list_append_ms = 0.0
+        event_ordering_ms = 0.0
+        event_id_index_ms = 0.0
+        event_id_lookup_ms = 0.0
+        event_id_insert_ms = 0.0
+        bookmark_index_ms = 0.0
+        event_index_size_before = len(self._events_by_id)
+        event_dict_bytes_before = sys.getsizeof(self._events_by_id) if performance.ENABLED else 0
+        bookmark_index_size_before = len(self._bookmark_nodes)
+        bookmark_dict_bytes_before = sys.getsizeof(self._bookmark_nodes) if performance.ENABLED else 0
+        event_index_gc_count_before = gc.get_count() if performance.ENABLED else (0, 0, 0)
+        event_index_gc_collections_before = self._gc_collections() if performance.ENABLED else (0, 0, 0)
+        event_index_new_key_count = 0
+        event_index_existing_key_count = 0
+        event_list_bytes_delta = 0
+        bookmark_set_bytes_delta = 0
 
         if new_groups:
             first_row = len(self._roots)
+            begin_started_at = perf_counter() if performance.ENABLED else 0.0
             self.beginInsertRows(QModelIndex(), first_row, first_row + len(new_groups) - 1)
-            for key, group in new_groups:
+            index_started_at = perf_counter() if performance.ENABLED else 0.0
+            for key, bookmark_key, group in new_groups:
+                node_started_at = perf_counter() if performance.ENABLED else 0.0
                 node = _FileNode(key, len(self._roots))
                 self._roots.append(node)
                 self._nodes_by_key[key] = node
-                self._append_group_to_node(node, group)
+                event_started_at = perf_counter() if performance.ENABLED else 0.0
+                if gc_observer is not None:
+                    gc_observer.active_scope = "event_index"
+                index_metrics = self._append_group_to_node(node, group, bookmark_key)
+                if gc_observer is not None:
+                    gc_observer.active_scope = None
+                if performance.ENABLED:
+                    node_create_ms += (event_started_at - node_started_at) * 1000
+                    event_index_ms += (perf_counter() - event_started_at) * 1000
+                    event_list_append_ms += index_metrics.list_append_ms
+                    event_ordering_ms += index_metrics.ordering_ms
+                    event_id_lookup_ms += index_metrics.event_id_lookup_ms
+                    event_id_insert_ms += index_metrics.event_id_insert_ms
+                    bookmark_index_ms += index_metrics.bookmark_index_ms
+                    event_index_new_key_count += index_metrics.event_id_new_key_count
+                    event_index_existing_key_count += index_metrics.event_id_existing_key_count
+                    event_list_bytes_delta += index_metrics.event_list_bytes_delta
+                    bookmark_set_bytes_delta += index_metrics.bookmark_set_bytes_delta
+            end_started_at = perf_counter() if performance.ENABLED else 0.0
             self.endInsertRows()
+            if performance.ENABLED:
+                begin_insert_ms += (index_started_at - begin_started_at) * 1000
+                index_update_ms += (end_started_at - index_started_at) * 1000
+                end_insert_ms += (perf_counter() - end_started_at) * 1000
 
-        for node, group in existing_groups:
+        for node, bookmark_key, group in existing_groups:
             parent = self._index_for_node(node, 0)
             row = len(node.events)
+            begin_started_at = perf_counter() if performance.ENABLED else 0.0
             self.beginInsertRows(parent, row, row + len(group) - 1)
-            self._append_group_to_node(node, group)
+            index_started_at = perf_counter() if performance.ENABLED else 0.0
+            event_started_at = perf_counter() if performance.ENABLED else 0.0
+            if gc_observer is not None:
+                gc_observer.active_scope = "event_index"
+            index_metrics = self._append_group_to_node(node, group, bookmark_key)
+            if gc_observer is not None:
+                gc_observer.active_scope = None
+            if performance.ENABLED:
+                event_index_ms += (perf_counter() - event_started_at) * 1000
+                event_list_append_ms += index_metrics.list_append_ms
+                event_ordering_ms += index_metrics.ordering_ms
+                event_id_lookup_ms += index_metrics.event_id_lookup_ms
+                event_id_insert_ms += index_metrics.event_id_insert_ms
+                bookmark_index_ms += index_metrics.bookmark_index_ms
+                event_index_new_key_count += index_metrics.event_id_new_key_count
+                event_index_existing_key_count += index_metrics.event_id_existing_key_count
+                event_list_bytes_delta += index_metrics.event_list_bytes_delta
+                bookmark_set_bytes_delta += index_metrics.bookmark_set_bytes_delta
+            end_started_at = perf_counter() if performance.ENABLED else 0.0
             self.endInsertRows()
+            if performance.ENABLED:
+                begin_insert_ms += (index_started_at - begin_started_at) * 1000
+                index_update_ms += (end_started_at - index_started_at) * 1000
+                end_insert_ms += (perf_counter() - end_started_at) * 1000
+
+        finished_at = perf_counter() if performance.ENABLED else 0.0
+        event_index_gc_count_after = gc.get_count() if performance.ENABLED else (0, 0, 0)
+        event_index_gc_collections_after = self._gc_collections() if performance.ENABLED else (0, 0, 0)
+        event_index_gc_duration_ms = self._event_index_gc_durations(gc_observer)
+        event_id_index_ms = event_id_lookup_ms + event_id_insert_ms
+        event_index_residual_ms = max(
+            0.0,
+            event_index_ms - event_list_append_ms - event_ordering_ms - event_id_index_ms - bookmark_index_ms,
+        )
+        return TimelineAppendMetrics(
+            input_event_count=len(events),
+            unique_event_count=len(unique_events),
+            duplicate_event_count=duplicate_event_count,
+            event_type_count=event_type_count,
+            empty_event_id_count=empty_event_id_count,
+            max_event_id_length=max_event_id_length,
+            inserted_parent_count=len(new_groups),
+            existing_parent_count=len(existing_groups),
+            inserted_child_count=len(unique_events),
+            insert_signal_count=int(bool(new_groups)) + len(existing_groups),
+            prepare_delta_ms=(prepared_at - started_at) * 1000 if performance.ENABLED else 0.0,
+            parent_lookup_ms=(looked_up_at - prepared_at) * 1000 if performance.ENABLED else 0.0,
+            model_insert_ms=(finished_at - looked_up_at) * 1000 if performance.ENABLED else 0.0,
+            begin_insert_ms=begin_insert_ms,
+            index_update_ms=index_update_ms,
+            end_insert_ms=end_insert_ms,
+            node_create_ms=node_create_ms,
+            event_index_ms=event_index_ms,
+            event_list_append_ms=event_list_append_ms,
+            event_ordering_ms=event_ordering_ms,
+            event_id_lookup_ms=event_id_lookup_ms,
+            event_id_insert_ms=event_id_insert_ms,
+            event_id_index_ms=event_id_index_ms,
+            bookmark_index_ms=bookmark_index_ms,
+            event_index_residual_ms=event_index_residual_ms,
+            event_index_size_before=event_index_size_before,
+            event_index_size_after=len(self._events_by_id),
+            event_dict_bytes_before=event_dict_bytes_before,
+            event_dict_bytes_after=sys.getsizeof(self._events_by_id) if performance.ENABLED else 0,
+            event_index_new_key_count=event_index_new_key_count,
+            event_index_existing_key_count=event_index_existing_key_count,
+            event_list_bytes_delta=event_list_bytes_delta,
+            bookmark_index_size_before=bookmark_index_size_before,
+            bookmark_index_size_after=len(self._bookmark_nodes),
+            bookmark_dict_bytes_before=bookmark_dict_bytes_before,
+            bookmark_dict_bytes_after=sys.getsizeof(self._bookmark_nodes) if performance.ENABLED else 0,
+            bookmark_set_bytes_delta=bookmark_set_bytes_delta,
+            event_index_gc_count_before=event_index_gc_count_before,
+            event_index_gc_count_after=event_index_gc_count_after,
+            event_index_gc_collections=(
+                event_index_gc_collections_after[0] - event_index_gc_collections_before[0],
+                event_index_gc_collections_after[1] - event_index_gc_collections_before[1],
+                event_index_gc_collections_after[2] - event_index_gc_collections_before[2],
+            ),
+            event_index_gc_duration_ms=event_index_gc_duration_ms,
+        )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
         if not parent.isValid():
@@ -237,21 +491,111 @@ class TimelineTreeModel(QAbstractItemModel):
             node = _FileNode(self._file_key(event), len(self._roots))
             self._roots.append(node)
             self._nodes_by_key[node.key] = node
-        self._append_group_to_node(node, (event,))
+        self._append_group_to_node(node, (event,), self.bookmark_key_at_event(event))
 
-    def _append_group_to_node(self, node: _FileNode, events: Sequence[TimelineEvent]) -> None:
+    def _append_group_to_node(
+        self,
+        node: _FileNode,
+        events: Sequence[TimelineEvent],
+        bookmark_key: BookmarkKey | None = None,
+    ) -> _EventIndexMetrics:
         """Updates Python indexes once per batch, without Qt work per event."""
+        list_append_ms = 0.0
+        ordering_ms = 0.0
+        event_id_lookup_ms = 0.0
+        event_id_insert_ms = 0.0
+        bookmark_index_ms = 0.0
+        event_id_new_key_count = 0
+        event_id_existing_key_count = 0
+        event_list_bytes_delta = 0
+        bookmark_set_bytes_delta = 0
         for event in events:
+            list_append_started_at = perf_counter() if performance.ENABLED else 0.0
+            list_bytes_before = sys.getsizeof(node.events) if performance.ENABLED else 0
             node.events.append(event)
+            ordering_started_at = perf_counter() if performance.ENABLED else 0.0
             if node.earliest_event is None or TimelineManager._sort_key(event) < TimelineManager._sort_key(
                 node.earliest_event
             ):
                 node.earliest_event = event
+            event_id_started_at = perf_counter() if performance.ENABLED else 0.0
             if event.event_id:
+                if performance.ENABLED:
+                    event_id_lookup_started_at = perf_counter()
+                    if event.event_id in self._events_by_id:
+                        event_id_existing_key_count += 1
+                    else:
+                        event_id_new_key_count += 1
+                    event_id_insert_started_at = perf_counter()
+                    event_id_lookup_ms += (event_id_insert_started_at - event_id_lookup_started_at) * 1000
+                else:
+                    event_id_insert_started_at = 0.0
                 self._events_by_id[event.event_id] = event
-            key = self.bookmark_key_at_event(event)
-            if key is not None:
-                self._bookmark_nodes.setdefault(key, set()).add(node.key)
+                if performance.ENABLED:
+                    event_id_insert_ms += (perf_counter() - event_id_insert_started_at) * 1000
+            if performance.ENABLED:
+                list_append_ms += (ordering_started_at - list_append_started_at) * 1000
+                event_list_bytes_delta += sys.getsizeof(node.events) - list_bytes_before
+                ordering_ms += (event_id_started_at - ordering_started_at) * 1000
+        if bookmark_key is not None:
+            bookmark_started_at = perf_counter() if performance.ENABLED else 0.0
+            bookmark_set = self._bookmark_nodes.get(bookmark_key)
+            bookmark_set_bytes_before = (
+                sys.getsizeof(bookmark_set) if bookmark_set is not None and performance.ENABLED else 0
+            )
+            self._bookmark_nodes.setdefault(bookmark_key, set()).add(node.key)
+            if performance.ENABLED:
+                bookmark_index_ms += (perf_counter() - bookmark_started_at) * 1000
+                bookmark_set = self._bookmark_nodes[bookmark_key]
+                bookmark_set_bytes_delta += sys.getsizeof(bookmark_set) - bookmark_set_bytes_before
+        return _EventIndexMetrics(
+            list_append_ms=list_append_ms,
+            ordering_ms=ordering_ms,
+            event_id_lookup_ms=event_id_lookup_ms,
+            event_id_insert_ms=event_id_insert_ms,
+            bookmark_index_ms=bookmark_index_ms,
+            event_id_new_key_count=event_id_new_key_count,
+            event_id_existing_key_count=event_id_existing_key_count,
+            event_list_bytes_delta=event_list_bytes_delta,
+            bookmark_set_bytes_delta=bookmark_set_bytes_delta,
+        )
+
+    @staticmethod
+    def _gc_collections() -> tuple[int, int, int]:
+        """Lit les compteurs GC sans installer de callback global."""
+        statistics = gc.get_stats()
+        return (
+            statistics[0]["collections"],
+            statistics[1]["collections"],
+            statistics[2]["collections"],
+        )
+
+    @staticmethod
+    def _start_gc_observer() -> _GCCheckpointObserver | None:
+        if not performance.ENABLED:
+            return None
+        observer = _GCCheckpointObserver(get_ident())
+        gc.callbacks.append(observer)
+        return observer
+
+    @staticmethod
+    def _stop_gc_observer(observer: _GCCheckpointObserver | None) -> None:
+        if observer is None:
+            return
+        try:
+            gc.callbacks.remove(observer)
+        except ValueError:
+            pass
+
+    @staticmethod
+    def _event_index_gc_durations(observer: _GCCheckpointObserver | None) -> tuple[float, float, float]:
+        if observer is None:
+            return 0.0, 0.0, 0.0
+        return (
+            observer.event_index_duration_ms[0],
+            observer.event_index_duration_ms[1],
+            observer.event_index_duration_ms[2],
+        )
 
     def _new_events(self, events: Sequence[TimelineEvent]) -> tuple[TimelineEvent, ...]:
         """Keep an event insertion idempotent across lazy batches and reloads."""
@@ -421,6 +765,7 @@ class TimelineFilterProxyModel(QSortFilterProxyModel):
         self._event_type = ""
         self._search_texts: dict[int, str] = {}
         self._building = False
+        self._performance_less_than_calls = 0
         self.setDynamicSortFilter(True)
         self.setRecursiveFilteringEnabled(True)
         self.setSortRole(TimelineTreeModel.SORT_ROLE)
@@ -456,6 +801,19 @@ class TimelineFilterProxyModel(QSortFilterProxyModel):
 
     def set_grouping(self, _grouping: str) -> None:
         """Compatibilité workspace : la hiérarchie est désormais toujours par fichier."""
+
+    def reset_performance_less_than_calls(self) -> None:
+        """Réinitialise le compteur de tri utilisé uniquement par le diagnostic opt-in."""
+        if performance.ENABLED:
+            self._performance_less_than_calls = 0
+
+    def performance_less_than_calls(self) -> int:
+        return self._performance_less_than_calls if performance.ENABLED else 0
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
+        if performance.ENABLED:
+            self._performance_less_than_calls += 1
+        return super().lessThan(left, right)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         model = self.sourceModel()

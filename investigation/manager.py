@@ -899,6 +899,26 @@ class InvestigationManager:
         self._index_case_membership(membership)
         return membership
 
+    def add_to_case_batch(self, memberships: tuple[CaseMembership, ...]) -> tuple[CaseMembership, ...]:
+        """Ajoute des memberships Case validés en une seule écriture logique."""
+        self._require_open()
+        pairs: set[tuple[InvestigationCaseId, InvestigationTargetRef]] = set()
+        membership_ids: set[CaseMembershipId] = set()
+        for membership in memberships:
+            if membership.membership_id in membership_ids or membership.membership_id in self._case_memberships_by_id:
+                raise ValueError(f"CaseMembership déjà existant : {membership.membership_id}")
+            if membership.case_id not in self._cases_by_id:
+                raise KeyError(f"InvestigationCase introuvable : {membership.case_id}")
+            pair = membership.case_id, membership.target_ref
+            if pair in pairs or pair in self._case_membership_id_by_pair:
+                raise ValueError("Cette cible appartient déjà à cette Case.")
+            pairs.add(pair)
+            membership_ids.add(membership.membership_id)
+        self._repository.create_case_memberships_batch(memberships)
+        for membership in memberships:
+            self._index_case_membership(membership)
+        return memberships
+
     def remove_from_case(self, case_id: InvestigationCaseId, target: InvestigationTargetRef) -> None:
         self._require_open()
         membership_id = self._case_membership_id_by_pair.get((case_id, target))
