@@ -150,6 +150,9 @@ class TimelineTreeModel(QAbstractItemModel):
         self._nodes_by_key: dict[str, _FileNode] = {}
         self._events_by_id: dict[str, TimelineEvent] = {}
         self._bookmark_nodes: dict[BookmarkKey, set[str]] = {}
+        self._selected_node_count = 0
+        self._last_selection_notification_count = 0
+        self._last_selection_header_update_count = 0
         self._investigation_lookup = None
         self._file_selection = file_selection or FileSelectionModel(self)
         if bookmark_service is not None:
@@ -165,6 +168,7 @@ class TimelineTreeModel(QAbstractItemModel):
         self._bookmark_nodes = {}
         for event in self._new_events(events):
             self._append_to_indexes(event)
+        self._selected_node_count = sum(self._file_selection.contains(file_id) for file_id in self._nodes_by_key)
         self.endResetModel()
 
     def append_events(self, events: Sequence[TimelineEvent]) -> TimelineAppendMetrics:
@@ -246,6 +250,8 @@ class TimelineTreeModel(QAbstractItemModel):
                 node = _FileNode(key, len(self._roots))
                 self._roots.append(node)
                 self._nodes_by_key[key] = node
+                if self._file_selection.contains(key):
+                    self._selected_node_count += 1
                 event_started_at = perf_counter() if performance.ENABLED else 0.0
                 if gc_observer is not None:
                     gc_observer.active_scope = "event_index"
@@ -401,9 +407,19 @@ class TimelineTreeModel(QAbstractItemModel):
     def headerData(
         self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole
     ):  # noqa: N802
+        if orientation == Qt.Orientation.Horizontal and section == self.SELECTION_COLUMN:
+            selected_count = self._selected_node_count
+            if role == Qt.ItemDataRole.CheckStateRole:
+                if not selected_count:
+                    return Qt.CheckState.Unchecked
+                return (
+                    Qt.CheckState.Checked
+                    if selected_count == len(self._nodes_by_key)
+                    else Qt.CheckState.PartiallyChecked
+                )
+            if role == Qt.ItemDataRole.DisplayRole:
+                return "☐" if not selected_count else "☑" if selected_count == len(self._nodes_by_key) else "◪"
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            if section == self.SELECTION_COLUMN:
-                return "☑" if self._file_selection.count else "☐"
             return self.COLUMNS[section]
         return None
 
@@ -426,7 +442,30 @@ class TimelineTreeModel(QAbstractItemModel):
         node = index.internalPointer()
         if not isinstance(node, _FileNode):
             return False
-        self._file_selection.toggle(node.key, value == Qt.CheckState.Checked)
+        selected_before = self._file_selection.count
+        started_at = perf_counter() if performance.ENABLED else 0.0
+        with performance.operation("TimelineBulkSelection", "toggle_one"):
+            change = self._file_selection.toggle(node.key, value == Qt.CheckState.Checked)
+        if performance.ENABLED:
+            duration_ms = (perf_counter() - started_at) * 1000
+            changed = bool(change.changed_ids)
+            performance.LOGGER.info(
+                "[TimelineBulkSelection] operation=toggle_one duration_ms=%.2f total_files=%d visible_rows=%d "
+                "selected_before=%d selected_after=%d ids_added=%d ids_removed=%d "
+                "data_changed_emissions=%d changed_ranges=%d model_reset_count=0 layout_changed_count=0 "
+                "header_updates=%d investigation_refreshes=0 main_thread_ms=%.2f",
+                duration_ms,
+                len(self._nodes_by_key),
+                len(self._roots),
+                selected_before,
+                self._file_selection.count,
+                len(change.added),
+                len(change.removed),
+                self._last_selection_notification_count if changed else 0,
+                self._last_selection_notification_count if changed else 0,
+                self._last_selection_header_update_count if changed else 0,
+                duration_ms,
+            )
         return True
 
     def event_for_index(self, index: QModelIndex) -> TimelineEvent | None:
@@ -491,6 +530,8 @@ class TimelineTreeModel(QAbstractItemModel):
             node = _FileNode(self._file_key(event), len(self._roots))
             self._roots.append(node)
             self._nodes_by_key[node.key] = node
+            if self._file_selection.contains(node.key):
+                self._selected_node_count += 1
         self._append_group_to_node(node, (event,), self.bookmark_key_at_event(event))
 
     def _append_group_to_node(
@@ -729,13 +770,48 @@ class TimelineTreeModel(QAbstractItemModel):
         self._emit_column_changed(self.BOOKMARK_COLUMN)
 
     def _on_file_selection_changed(self, change: FileSelectionChange) -> None:
-        self.headerDataChanged.emit(Qt.Orientation.Horizontal, self.SELECTION_COLUMN, self.SELECTION_COLUMN)
-        for file_id in change.changed_ids:
-            node = self._nodes_by_key.get(file_id)
-            if node is None:
-                continue
-            index = self._index_for_node(node, self.SELECTION_COLUMN)
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole, self.SORT_ROLE])
+        with performance.operation("TimelineBulkSelection", "model_notify"):
+            self._selected_node_count += sum(file_id in self._nodes_by_key for file_id in change.added)
+            self._selected_node_count -= sum(file_id in self._nodes_by_key for file_id in change.removed)
+            self._last_selection_notification_count = 0
+            self._last_selection_header_update_count = 0
+            with performance.operation("TimelineBulkSelection", "header_update"):
+                self.headerDataChanged.emit(Qt.Orientation.Horizontal, self.SELECTION_COLUMN, self.SELECTION_COLUMN)
+                self._last_selection_header_update_count = 1
+            rows = [node.row for file_id in change.changed_ids if (node := self._nodes_by_key.get(file_id)) is not None]
+            if not rows:
+                return
+            roles = [Qt.ItemDataRole.CheckStateRole]
+            if len(rows) > 128:
+                self.dataChanged.emit(
+                    self.index(min(rows), self.SELECTION_COLUMN),
+                    self.index(max(rows), self.SELECTION_COLUMN),
+                    roles,
+                )
+                self._last_selection_notification_count = 1
+                return
+            rows.sort()
+            start = previous = rows[0]
+            for row in (*rows[1:], None):
+                if row is not None and row == previous + 1:
+                    previous = row
+                    continue
+                self.dataChanged.emit(
+                    self.index(start, self.SELECTION_COLUMN), self.index(previous, self.SELECTION_COLUMN), roles
+                )
+                self._last_selection_notification_count += 1
+                if row is not None:
+                    start = previous = row
+
+    @property
+    def last_selection_notification_count(self) -> int:
+        """Number of targeted Qt notifications emitted for the last selection batch."""
+        return self._last_selection_notification_count
+
+    @property
+    def last_selection_header_update_count(self) -> int:
+        """Number of header updates emitted for the last selection batch."""
+        return self._last_selection_header_update_count
 
     def _emit_node_column_changed(self, node: _FileNode, column: int) -> None:
         group = self._index_for_node(node, column)

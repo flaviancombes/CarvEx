@@ -36,6 +36,7 @@ from timeline.service import TimelineService
 from timeline.source import EventType
 from ui.background_activity import BackgroundTaskRegistry
 from ui.bookmark_delegate import BookmarkStarDelegate
+from ui.file_table import _FileSelectionDelegate
 from ui.investigation_context_menu import append_investigation_actions
 from utils import performance
 
@@ -157,6 +158,7 @@ class TimelineView(QWidget):
         self._event_types: dict[str, EventType] = {}
         self._pending_event_type = ""
         self._pending_sort_state: tuple[int, Qt.SortOrder] | None = None
+        self._selection_transition_pending = False
         self._investigation_presence_lookup: Callable[[object], bool] | None = None
         self._entity_resolver = entity_resolver or CanonicalEntityResolver()
         self._background_tasks = background_tasks
@@ -180,6 +182,7 @@ class TimelineView(QWidget):
         self.event_type.addItem("Tous les événements", "")
         self.table = QTreeView(self)
         self.table.setModel(self._proxy)
+        self.table.setItemDelegateForColumn(TimelineTableModel.SELECTION_COLUMN, _FileSelectionDelegate(self.table))
         self.table.setItemDelegateForColumn(TimelineTableModel.BOOKMARK_COLUMN, BookmarkStarDelegate(self.table))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -203,8 +206,8 @@ class TimelineView(QWidget):
         self.table.doubleClicked.connect(self._activate_index)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
-        self.table.selectionModel().currentRowChanged.connect(self._select_index)
-        self.table.clicked.connect(lambda index: self._select_index(index, QModelIndex()))
+        self.table.selectionModel().currentRowChanged.connect(self._on_current_row_changed)
+        self.table.clicked.connect(self._on_index_clicked)
         self.search.textChanged.connect(self._apply_filters)
         self.category.currentIndexChanged.connect(self._apply_filters)
         self.event_type.currentIndexChanged.connect(self._apply_filters)
@@ -257,9 +260,16 @@ class TimelineView(QWidget):
         return bar
 
     def _on_file_selection_changed(self, _change) -> None:
+        started_at = perf_counter() if performance.ENABLED else 0.0
         count = self.file_selection.count
         self.bulk_label.setText(f"{count} fichier(s) sélectionné(s)")
         self.bulk_bar.setVisible(bool(count))
+        if performance.ENABLED:
+            performance.LOGGER.info(
+                "[TimelineBulkSelection] scope=action_bar_update duration_ms=%.2f selected_after=%d",
+                (perf_counter() - started_at) * 1000,
+                count,
+            )
 
     def _bookmark_selected(self) -> None:
         if self._bookmark_service is None:
@@ -654,11 +664,38 @@ class TimelineView(QWidget):
     def _toggle_header_selection(self, section: int) -> None:
         if section != TimelineTableModel.SELECTION_COLUMN:
             return
+        started_at = perf_counter() if performance.ENABLED else 0.0
         visible_ids = self._visible_file_ids()
+        selected_before = self.file_selection.count
         if visible_ids and all(self.file_selection.contains(file_id) for file_id in visible_ids):
-            self.file_selection.deselect_many(visible_ids)
+            operation = "clear_all"
+            with performance.operation("TimelineBulkSelection", operation):
+                change = self.file_selection.deselect_many(visible_ids)
         else:
-            self.file_selection.select_many(visible_ids)
+            operation = "select_all"
+            with performance.operation("TimelineBulkSelection", operation):
+                change = self.file_selection.select_many(visible_ids)
+        if performance.ENABLED:
+            duration_ms = (perf_counter() - started_at) * 1000
+            changed = bool(change.changed_ids)
+            performance.LOGGER.info(
+                "[TimelineBulkSelection] operation=%s duration_ms=%.2f total_files=%d visible_rows=%d "
+                "selected_before=%d selected_after=%d ids_added=%d ids_removed=%d "
+                "data_changed_emissions=%d changed_ranges=%d model_reset_count=0 layout_changed_count=0 "
+                "header_updates=%d investigation_refreshes=0 main_thread_ms=%.2f",
+                operation,
+                duration_ms,
+                self._model.rowCount(),
+                len(visible_ids),
+                selected_before,
+                self.file_selection.count,
+                len(change.added),
+                len(change.removed),
+                self._model.last_selection_notification_count if changed else 0,
+                self._model.last_selection_notification_count if changed else 0,
+                self._model.last_selection_header_update_count if changed else 0,
+                duration_ms,
+            )
 
     def _visible_file_ids(self) -> tuple[str, ...]:
         file_ids: list[str] = []
@@ -671,7 +708,8 @@ class TimelineView(QWidget):
 
     def _activate_index(self, index) -> None:
         if self._proxy.is_file_index(index):
-            self.table.setExpanded(index, not self.table.isExpanded(index))
+            parent = index.siblingAtColumn(0)
+            self.table.setExpanded(parent, not self.table.isExpanded(parent))
             return
         event = self._proxy.event_for_index(index)
         if event is not None:
@@ -702,7 +740,21 @@ class TimelineView(QWidget):
         )
         return menu
 
-    def _select_index(self, current, _previous) -> None:
+    def _on_current_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
+        """Publie les changements de sélection, y compris au clavier."""
+        self._selection_transition_pending = True
+        self._select_index(current)
+        QTimer.singleShot(0, self._clear_selection_transition)
+
+    def _on_index_clicked(self, index: QModelIndex) -> None:
+        """Publie un re-clic sans dupliquer le changement de ligne courant."""
+        if not self._selection_transition_pending:
+            self._select_index(index)
+
+    def _clear_selection_transition(self) -> None:
+        self._selection_transition_pending = False
+
+    def _select_index(self, current: QModelIndex) -> None:
         """Publie la sélection simple, sans imposer de navigation entre onglets."""
         event = self._proxy.event_for_index(current)
         if event is not None:
