@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from time import perf_counter
 from typing import Any
 
 from PySide6.QtCore import QEvent, QModelIndex, QPoint, Qt, QTimer, Signal
@@ -82,6 +83,7 @@ class FileTable(QWidget):
         ("Photos d'appareil photo", "image.camera"),
         ("Images modifiées", "image.modified"),
     )
+    SEARCH_DEBOUNCE_MS = 100
 
     def __init__(
         self,
@@ -120,13 +122,18 @@ class FileTable(QWidget):
         self._selection_restore_pending = False
         self._investigation_item_lookup: Callable[[Mapping[str, Any]], bool] | None = None
         self._metadata_index: MetadataIndex | None = None
+        self._pending_search_text = ""
         self.file_actions = FileActions(self)
         self.file_actions.status_message.connect(self.status_message)
 
         self.search_field = QLineEdit(self)
         self.search_field.setPlaceholderText("Rechercher un nom, hash, type ou chemin…")
         self.search_field.setClearButtonEnabled(True)
-        self.search_field.textChanged.connect(self._set_search_text)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(self.SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._apply_pending_search)
+        self.search_field.textChanged.connect(self._queue_search_text)
 
         filters = self._create_filters()
         self.metadata_filters = MetadataFilterPanel(self)
@@ -286,14 +293,45 @@ class FileTable(QWidget):
     def set_investigation_item_lookup(self, lookup: Callable[[Mapping[str, Any]], bool] | None) -> None:
         self._investigation_item_lookup = lookup
 
+    def _queue_search_text(self, text: str) -> None:
+        """Coalesce les frappes proches sans modifier la sémantique de recherche."""
+        self._pending_search_text = text
+        self._search_timer.start()
+
+    def _apply_pending_search(self) -> None:
+        self._set_search_text(self._pending_search_text)
+
     def _set_search_text(self, text: str) -> None:
         with performance.operation("FileTable", "universal_search"):
             self._remember_current_file()
-            metadata_matches = self._metadata_index.search(text) if self._metadata_index else frozenset()
-            correlation_matches = self.correlation_filters.search_matches(text)
-            self._proxy_model.set_universal_search(text, metadata_matches | correlation_matches)
-            self._emit_view_state()
-            self._restore_last_selection()
+            started_at = perf_counter() if performance.ENABLED else 0.0
+            with performance.measure("UniversalSearch.prepare_query", query_length=len(text)):
+                normalized_text = text.casefold().strip()
+            with performance.measure("UniversalSearch.collect_metadata", query=normalized_text):
+                metadata_matches = self._metadata_index.search(text) if self._metadata_index else frozenset()
+            with performance.measure("UniversalSearch.collect_correlations", query=normalized_text):
+                correlation_matches = self.correlation_filters.search_matches(text)
+            with performance.measure("UniversalSearch.merge_matches"):
+                indexed_matches = metadata_matches | correlation_matches
+            with performance.measure("UniversalSearch.model_update", source_rows=self._source_model.rowCount()):
+                self._proxy_model.set_universal_search(text, indexed_matches)
+            with performance.measure("UniversalSearch.counter_update"):
+                self._emit_view_state()
+            with performance.measure("UniversalSearch.selection_restore"):
+                self._restore_last_selection()
+            if performance.ENABLED:
+                performance.LOGGER.info(
+                    "[UniversalSearch] action duration_ms=%.2f query=%r source_count=%d "
+                    "metadata_matches=%d correlation_matches=%d indexed_matches=%d main_thread_ms=%.2f "
+                    "worker_ms=0.00",
+                    (perf_counter() - started_at) * 1000,
+                    normalized_text,
+                    self._source_model.rowCount(),
+                    len(metadata_matches),
+                    len(correlation_matches),
+                    len(indexed_matches),
+                    (perf_counter() - started_at) * 1000,
+                )
 
     def set_metadata_index(self, index: MetadataIndex | None) -> None:
         """Makes the persistent metadata index available to the filters only."""

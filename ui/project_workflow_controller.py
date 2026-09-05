@@ -356,11 +356,14 @@ class ProjectWorkflowController(QObject):
         thread = QThread(self)
         worker = ProjectSaveWorker(repository)
         worker.moveToThread(thread)
-        thread.started.connect(worker.run)
+        # ``started`` is emitted before QThread enters its event loop.  Deferring
+        # the worker to that loop guarantees that its ``finished`` shutdown
+        # request cannot be lost during thread startup.
+        thread.started.connect(lambda: QTimer.singleShot(0, worker.run))
         worker.phase.connect(self._update_save_phase, Qt.ConnectionType.QueuedConnection)
         worker.succeeded.connect(self._on_save_succeeded, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._on_save_failed, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._clear_save_worker)
         thread.finished.connect(thread.deleteLater)

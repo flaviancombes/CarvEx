@@ -462,6 +462,11 @@ def test_close_with_async_save_closes_main_window_without_second_click(tmp_path,
     assert not window.isVisible()
     assert storage.full_flush_count == 1
     assert window.project_manager.active_project is None
+    for _ in range(100):
+        if window._projects._save_thread is None:
+            break
+        QTest.qWait(20)
+    assert window._projects._save_thread is None
 
 
 def test_failed_async_close_leaves_investigation_operational(tmp_path, monkeypatch) -> None:

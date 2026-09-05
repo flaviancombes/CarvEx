@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from PySide6.QtTest import QTest
+
 from metadata.base import MetadataCategory, MetadataField
 from metadata.correlation import MetadataCorrelation, MetadataCorrelationIndex, MetadataCorrelationType
 from metadata.index import MetadataIndex
@@ -117,9 +119,13 @@ def test_universal_search_uses_only_existing_metadata_and_correlation_indexes(qa
     table.set_correlation_index(_index())
 
     table.search_field.setText("Nikon")
+    QTest.qWait(FileTable.SEARCH_DEBOUNCE_MS + 50)
+    qapp.processEvents()
     assert table.visible_file_count == 1
     assert table.record_for_index(table._proxy_model.index(0, 0))["file_id"] == FILE_2
     table.search_field.setText("Canon")
+    QTest.qWait(FileTable.SEARCH_DEBOUNCE_MS + 50)
+    qapp.processEvents()
     assert table.visible_file_count == 2
 
 
@@ -129,11 +135,11 @@ def test_selection_is_restored_by_file_id_after_filter_changes(qtbot):
     table.set_files(_records())
     table.select_record(_records()[1])
     table.search_field.setText("two")
-    qtbot.wait(10)
+    qtbot.wait(FileTable.SEARCH_DEBOUNCE_MS + 50)
 
     assert table.record_for_index(table.view.currentIndex())["file_id"] == FILE_2
     table.search_field.clear()
-    qtbot.wait(10)
+    qtbot.wait(FileTable.SEARCH_DEBOUNCE_MS + 50)
     assert table.record_for_index(table.view.currentIndex())["file_id"] == FILE_2
 
 

@@ -63,6 +63,30 @@ class _CorrelationFilterProfile:
     source_role_accesses_start: dict[int, int] | None = None
 
 
+@dataclass(slots=True)
+class _UniversalSearchProfile:
+    """Mesure agrégée d'une recherche universelle sans instrumenter chaque ligne."""
+
+    query: str
+    source_rows: int
+    indexed_matches: int
+    started_at: float
+    thread_name: str
+    filter_calls: int = 0
+    accepted_rows: int = 0
+    rejected_rows: int = 0
+    sort_calls: int = 0
+    model_resets: int = 0
+    layout_changes: int = 0
+    data_changes: int = 0
+    filter_sample_calls: int = 0
+    filter_sample_seconds: float = 0.0
+    sort_sample_calls: int = 0
+    sort_sample_seconds: float = 0.0
+    source_data_accesses_start: int = 0
+    source_role_accesses_start: dict[int, int] | None = None
+
+
 class ArtifactCacheLookup(Protocol):
     """Contrat de lecture : il ne déclenche jamais de calcul d'artefacts."""
 
@@ -102,6 +126,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         self._universal_matches: frozenset[str] = frozenset()
         self._category_profile: _CategoryFilterProfile | None = None
         self._correlation_profile: _CorrelationFilterProfile | None = None
+        self._universal_search_profile: _UniversalSearchProfile | None = None
         self._text_collator = QCollator()
         self._text_collator.setCaseSensitivity(Qt.CaseSensitivity.CaseSensitive)
         self.setDynamicSortFilter(True)
@@ -122,10 +147,29 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         normalized = text.casefold().strip()
         if normalized == self._search_text and matches == self._universal_matches:
             return
+        self._finish_universal_search_profile()
+        model = self.sourceModel()
+        self._universal_search_profile = (
+            _UniversalSearchProfile(
+                query=normalized,
+                source_rows=model.rowCount() if isinstance(model, FileTableModel) else 0,
+                indexed_matches=len(matches),
+                started_at=perf_counter(),
+                thread_name=current_thread().name,
+            )
+            if performance.ENABLED
+            else None
+        )
+        if self._universal_search_profile is not None and isinstance(model, FileTableModel):
+            accesses, roles = model.performance_data_accesses()
+            self._universal_search_profile.source_data_accesses_start = accesses
+            self._universal_search_profile.source_role_accesses_start = roles
         self.beginFilterChange()
         self._search_text = normalized
         self._universal_matches = matches
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+        if self._universal_search_profile is not None:
+            QTimer.singleShot(0, self._finish_universal_search_profile)
 
     def set_category(self, category: str) -> None:
         if category == self._category:
@@ -241,7 +285,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         self._artifact_matches.clear()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
-        profile = self._category_profile or self._correlation_profile
+        profile = self._category_profile or self._correlation_profile or self._universal_search_profile
         if profile is not None:
             profile.filter_calls += 1
             sample_started = perf_counter() if profile.filter_calls % 1024 == 1 else None
@@ -254,6 +298,11 @@ class FileFilterProxyModel(QSortFilterProxyModel):
                     self._correlation_profile.accepted_rows += 1
                 else:
                     self._correlation_profile.rejected_rows += 1
+            if self._universal_search_profile is not None:
+                if accepted:
+                    self._universal_search_profile.accepted_rows += 1
+                else:
+                    self._universal_search_profile.rejected_rows += 1
             return accepted
         finally:
             if sample_started is not None and profile is not None:
@@ -316,9 +365,18 @@ class FileFilterProxyModel(QSortFilterProxyModel):
             if profile is not None:
                 profile.accepted_rows += 1
             return True
-        accepted = filter_row.file_id in self._universal_matches or any(
-            self._search_text in value for value in filter_row.search_fields
-        )
+        if filter_row.file_id in self._universal_matches:
+            accepted = True
+        else:
+            name, category, mime, sha256, output, source_path = filter_row.search_fields
+            accepted = (
+                self._search_text in name
+                or self._search_text in category
+                or self._search_text in mime
+                or self._search_text in sha256
+                or self._search_text in output
+                or self._search_text in source_path
+            )
         if profile is not None:
             if accepted:
                 profile.accepted_rows += 1
@@ -327,7 +385,7 @@ class FileFilterProxyModel(QSortFilterProxyModel):
         return accepted
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
-        profile = self._category_profile or self._correlation_profile
+        profile = self._category_profile or self._correlation_profile or self._universal_search_profile
         if profile is not None:
             profile.sort_calls += 1
             sample_started = perf_counter() if profile.sort_calls % 1024 == 1 else None
@@ -397,18 +455,65 @@ class FileFilterProxyModel(QSortFilterProxyModel):
             self._category_profile.model_resets += 1
         if self._correlation_profile is not None:
             self._correlation_profile.model_resets += 1
+        if self._universal_search_profile is not None:
+            self._universal_search_profile.model_resets += 1
 
     def _record_layout_change(self) -> None:
         if self._category_profile is not None:
             self._category_profile.layout_changes += 1
         if self._correlation_profile is not None:
             self._correlation_profile.layout_changes += 1
+        if self._universal_search_profile is not None:
+            self._universal_search_profile.layout_changes += 1
 
     def _record_data_change(self, *_args) -> None:
         if self._category_profile is not None:
             self._category_profile.data_changes += 1
         if self._correlation_profile is not None:
             self._correlation_profile.data_changes += 1
+        if self._universal_search_profile is not None:
+            self._universal_search_profile.data_changes += 1
+
+    def _finish_universal_search_profile(self) -> None:
+        profile = self._universal_search_profile
+        if profile is None:
+            return
+        self._universal_search_profile = None
+        model = self.sourceModel()
+        if isinstance(model, FileTableModel):
+            source_rows = model.rowCount()
+            current_accesses, current_roles = model.performance_data_accesses()
+            data_accesses = current_accesses - profile.source_data_accesses_start
+            role_accesses = {
+                role: count - (profile.source_role_accesses_start or {}).get(role, 0)
+                for role, count in current_roles.items()
+                if count > (profile.source_role_accesses_start or {}).get(role, 0)
+            }
+        else:
+            source_rows = 0
+            data_accesses = 0
+            role_accesses = {}
+        performance.LOGGER.info(
+            "[UniversalSearch] model_update duration_ms=%.2f thread=%s query=%r source_rows=%d "
+            "source_rows_at_start=%d indexed_matches=%d filter_calls=%d accepted=%d rejected=%d "
+            "sort_calls=%d model_reset_count=%d layout_changed_count=%d data_changed_count=%d "
+            "source_data_accesses=%d source_roles=%s",
+            (perf_counter() - profile.started_at) * 1000,
+            profile.thread_name,
+            profile.query,
+            source_rows,
+            profile.source_rows,
+            profile.indexed_matches,
+            profile.filter_calls,
+            profile.accepted_rows,
+            profile.rejected_rows,
+            profile.sort_calls,
+            profile.model_resets,
+            profile.layout_changes,
+            profile.data_changes,
+            data_accesses,
+            role_accesses,
+        )
 
     def _schedule_category_profile_finish(self) -> None:
         QTimer.singleShot(0, self._finish_category_profile)
